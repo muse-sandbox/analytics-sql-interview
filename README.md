@@ -28,7 +28,7 @@ https://<server>/iv-task/<token>/   the active sample's task for the candidate
 4. After the interview: **Stop** removes the containers and keeps tables, users and questions on
    disk for the next start. **Stop and wipe data** also deletes the volumes, so the next start is a
    fresh install. Stopped, the stack takes no RAM or CPU. Only two small processes keep running:
-   the admin container (~60 MB) and the controller (~15 MB).
+   the admin container (~80 MB) and the controller (~10 MB).
 
 ## Samples (saved interview cases)
 
