@@ -888,7 +888,7 @@ setInterval(poll, {3000 if busy else 15000});
             load_btn = ""
             if phase == "ready":
                 load_btn = (f"<form class='inline' method='post' action='{P}/samples/{m['slug']}/load' "
-                            f"onsubmit=\"return confirm('Recreate the tables of this sample?')\"><button class='sec'>load</button></form>")
+                            f"onsubmit=\"return confirm('Recreate this sample\\'s tables and drop every other table in interview?')\"><button class='sec'>load</button></form>")
             samples_html += (f"<tr><td><a href='{P}/samples/{m['slug']}/'>{e(m['name'])}</a>{active}</td>"
                              f"<td class='mono'>{e(tbls)}</td><td>{fmt_bytes(m['size'])}</td>"
                              f"<td class='muted'>{e(m.get('created'))}</td>"
@@ -1280,6 +1280,12 @@ def load_sample(slug: str) -> list[str]:
         finally:
             copy.unlink(missing_ok=True)
         loaded.append(f"{t['name']} ({rows:,} rows)")
+    # a sample is the whole database: tables of other samples / earlier uploads must not leak in
+    keep = {t["name"] for t in meta["tables"]}
+    for name in [r["name"] for r in list_tables()]:
+        if name not in keep:
+            ch(f"DROP TABLE IF EXISTS `{CH_DB}`.`{name}`")
+            loaded.append(f"dropped {name}")
     if not STACK.get("task_token"):
         set_stack(task_token=secrets.token_urlsafe(24))
     set_stack(active_sample=slug)
@@ -1316,6 +1322,12 @@ def mb_task_card(meta: dict) -> None:
         "collection_position": 1,
     }
     cards = creds.setdefault("task_cards", {})
+    for slug, other_id in cards.items():  # only the active sample's question stays pinned
+        if slug != meta["slug"]:
+            try:
+                mb_api("PUT", f"/api/card/{other_id}", json={"archived": True})
+            except RuntimeError:
+                pass
     card_id = cards.get(meta["slug"])
     if card_id:
         try:
@@ -1421,7 +1433,7 @@ def sample_view(request: Request, slug: str):
     actions = ""
     if STACK.get("phase") == "ready":
         actions = (f"<form class='inline' method='post' action='{P}/samples/{slug}/load' "
-                   f"onsubmit=\"return confirm('Recreate this sample\\'s tables in the running stack?')\">"
+                   f"onsubmit=\"return confirm('Recreate this sample\\'s tables and drop every other table in interview?')\">"
                    f"<button>Load into the running stack</button></form>")
     actions += (f"<a href='{P}/samples/new?from={slug}'><button type='button' class='sec'>Edit / re-save from current tables</button></a>"
                 f"<form class='inline' method='post' action='{P}/samples/{slug}/delete' "

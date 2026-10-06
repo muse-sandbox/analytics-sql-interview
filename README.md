@@ -50,13 +50,13 @@ Using samples:
 - **Start with a sample.** On Start, pick a sample. Its tables are recreated after Metabase is ready.
   You can also press **load** on a sample while the stack is already running.
 - **What loading does:**
-  - recreates the sample's tables;
+  - recreates the sample's tables and drops every other table in `interview`, so a candidate sees only this case;
   - makes it the *active* sample;
   - shows the public task page `/iv-task/<token>/` in the admin and adds its link to each
     candidate's credentials block. The token is new on every start, and the page answers 404 while
     the stack is stopped;
   - saves the Metabase SQL question "<name> — start here", pinned in Our analytics. It carries the
-    task link in its comments and a starter `select`.
+    task link in its comments and a starter `select`. The questions of other samples are archived.
 - **Save current tables as a sample:** choose the tables, write task.md and readme.md, and attach files.
   Re-saving with "overwrite" replaces the data and keeps the existing attachments. On a sample's page
   you can read the readme, preview the task, edit both texts and delete the sample.

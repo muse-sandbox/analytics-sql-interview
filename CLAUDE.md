@@ -47,7 +47,7 @@ and saved interview "samples" (tables + candidate task + interviewer notes). Hum
 | `iv status` | JSON: `phase` (stopped / starting / ready / stopping / error), `message`, Metabase `url`, `task_url`, `auto_stop`, active `sample` |
 | `iv start [--sample SLUG] [--hours 2\|4\|8\|24\|0] [--no-wait]` | start (waits until ready, ~1.5–2 min; the first start after a wipe sets up Metabase). With `--sample`, the sample's tables, task page and Metabase "start here" question are created |
 | `iv stop` · `iv wipe --yes` · `iv extend` | stop (data kept) · stop and delete volumes · +2 h to the auto-stop timer |
-| `iv samples` · `iv load-sample SLUG` | list samples · (re)create a sample's tables in the running stack |
+| `iv samples` · `iv load-sample SLUG` | list samples · make the running stack hold exactly that sample: its tables are recreated and **every other table in `interview` is dropped**; other samples' "start here" questions are archived |
 | `iv infer FILE [--format F] [--delim D] [--no-nullable]` | print the schema ClickHouse would infer, without creating anything |
 | `iv upload FILE TABLE [--schema FILE] [--order-by EXPR] [--format F] [--delim D] [--replace] [--errors N] [--no-nullable]` | load a CSV/TSV into `interview.TABLE`. With `--schema` (one `column Type` per line, in the file's column order) the types are exactly those; names may differ from the header |
 | `iv drop TABLE` · `iv tables` | drop · list with rows and size |
@@ -75,7 +75,7 @@ and saved interview "samples" (tables + candidate task + interviewer notes). Hum
    - a schema file per table with exact types. Without one, ClickHouse infers `Nullable(...)` for
      every column, and an `IS NULL` check on a `LEFT JOIN` then behaves differently from a typed
      table.
-3. **Load:** `scp` the files to the server, then
+3. **Load** into a stack with no other tables you care about. Loading a sample later drops every other table anyway. `scp` the files to the server, then
    `iv upload data.csv events --schema events.schema --order-by "(event_at, id)"` for each table.
 4. **Verify as the candidate.** `iv tables` shows the row counts. Run the reference solution with
    `iv sql "<reference SQL>"` and compare it with the numbers you expect, e.g. from a pandas
