@@ -19,6 +19,7 @@
 #   iv deactivate USER_ID                       deactivate a candidate user
 #   iv save-sample NAME --tables T1,T2 --task TASK.md --readme README.md [--asset FILE]... [--overwrite]
 #   iv delete-sample SLUG --yes
+#   iv set-texts SLUG [--task TASK.md] [--readme README.md]   replace a sample's texts (no stack needed)
 #
 # Formats: CSVWithNames (default), CSV, TSVWithNames, TSV. Delimiters (CSV only): , ; |
 # A schema file has one `column Type` per line, in the file's column order.
@@ -74,7 +75,7 @@ upload_file() {  # prints the upload id
 
 cmd="${1:-help}"; shift || true
 case "$cmd" in
-    help|-h|--help) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    help|-h|--help) sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 esac
 login
 
@@ -187,6 +188,16 @@ for u in json.load(open("/opt/interview/state/candidates.json")):
 deactivate)
     [ -n "${1:-}" ] || die "usage: iv deactivate USER_ID"
     result "$("${C[@]}" -o /dev/null -w '%{redirect_url}' --data-urlencode "user_id=$1" "$P/users/deactivate")" ;;
+
+set-texts)
+    slug="${1:-}"; shift || die "usage: iv set-texts SLUG [--task FILE] [--readme FILE]"
+    dir="$HOME_DIR/samples/$slug"; [ -f "$dir/sample.json" ] || die "no sample '$slug'"
+    task="$dir/task.md" readme="$dir/readme.md"
+    while [ $# -gt 0 ]; do case "$1" in
+        --task) task="$2"; shift 2 ;; --readme) readme="$2"; shift 2 ;; *) die "unknown option $1" ;; esac; done
+    [ -f "$task" ] && [ -f "$readme" ] || die "no such file"
+    loc="$("${C[@]}" -o /dev/null -w '%{redirect_url}' --data-urlencode "task@$task" --data-urlencode "readme@$readme" "$P/samples/$slug/texts")"
+    result "$loc" ;;
 
 delete-sample)
     [ -n "${1:-}" ] && [ "${2:-}" = "--yes" ] || die "usage: iv delete-sample SLUG --yes"

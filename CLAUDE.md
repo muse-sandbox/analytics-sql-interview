@@ -53,7 +53,7 @@ and saved interview "samples" (tables + candidate task + interviewer notes). Hum
 | `iv drop TABLE` · `iv tables` | drop · list with rows and size |
 | `iv sql "SELECT …"` | run a query as the **candidates'** read-only ClickHouse user (it is the right way to check what a candidate sees) |
 | `iv user [NOTE]` · `iv users` · `iv deactivate ID` | candidate Metabase user (prints URL / login / password / task) · list · deactivate |
-| `iv save-sample NAME --tables T1,T2 --task TASK.md --readme README.md [--asset FILE]… [--overwrite]` · `iv delete-sample SLUG --yes` | save the current tables + texts as a sample · delete one |
+| `iv save-sample NAME --tables T1,T2 --task TASK.md --readme README.md [--asset FILE]… [--overwrite]` · `iv set-texts SLUG [--task F] [--readme F]` · `iv delete-sample SLUG --yes` | save the current tables + texts as a sample · replace only the texts (no stack needed) · delete one |
 
 `iv` exits non-zero and prints the admin's error on any failure. Files for `upload`, `infer`,
 `save-sample` must be on the server: `scp` them to `/root/` first and delete them afterwards.
