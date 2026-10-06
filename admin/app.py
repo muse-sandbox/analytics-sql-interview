@@ -1532,7 +1532,19 @@ EVAL_KEEP = 400
 RESULT_ROWS = 100
 PRICES = {"input": 2.0, "cache_read": 0.2, "cache_write": 2.5, "output": 10.0}  # $ per 1M tokens, Sonnet 5.5
 MB_HEADER = re.compile(r"^\s*--\s*Metabase::([^\n]*)\n?")
-EVAL: dict = jload(EVAL_FILE, {"items": [], "last_ts": 0, "auto": True, "version": 0})
+# only data queries go to the model; DESCRIBE / EXPLAIN / SHOW / EXISTS / SET … are listed but never evaluated
+EVALUABLE_KINDS = {"select"}
+LEADING_NOISE = re.compile(r"^(\s+|--[^\n]*(\n|$)|/\*.*?\*/|\()+", re.S)
+
+
+def query_kind(sql: str, logged_kind: str) -> str:
+    """ClickHouse's query_kind when known; for queries that failed before parsing, the first keyword."""
+    if logged_kind:
+        return logged_kind.lower()
+    word = re.match(r"[a-z]+", LEADING_NOISE.sub("", sql).lower())
+    first = word.group(0) if word else ""
+    return "select" if first in ("select", "with") else (first or "unknown")
+EVAL: dict = jload(EVAL_FILE, {"items": [], "last_ts": int(time.time() * 1e6), "auto": True, "version": 0})
 EVAL_PENDING: set = set()
 
 
@@ -1545,7 +1557,8 @@ def eval_save() -> None:
 
 def eval_reset() -> None:
     with LOCK:
-        EVAL.update(items=[], last_ts=0, version=EVAL.get("version", 0) + 1)
+        # read query_log only from now on: it keeps a day of history, earlier interviews included
+        EVAL.update(items=[], last_ts=int(time.time() * 1e6), version=EVAL.get("version", 0) + 1)
         jsave(EVAL_FILE, EVAL)
 
 
@@ -1569,6 +1582,7 @@ def poll_query_log() -> int:
     since = int(EVAL.get("last_ts") or 0)
     rows = ch_json(
         "SELECT toUnixTimestamp64Micro(event_time_microseconds) AS ts, query_id, toString(type) AS kind, "
+        "query_kind, "
         "query, exception, result_rows, query_duration_ms "
         "FROM system.query_log "
         f"WHERE event_date >= yesterday() AND user = 'metabase' AND type != 'QueryStart' "
@@ -1590,7 +1604,9 @@ def poll_query_log() -> int:
         if not sql:
             continue
         mb_user = int(uid.group(1))
+        kind = query_kind(sql, r.get("query_kind") or "")
         EVAL["items"].append({
+            "kind": kind, "evaluable": kind in EVALUABLE_KINDS,
             "id": r["query_id"], "ts": int(r["ts"]) / 1e6, "mb_user": mb_user, "who": candidate_label(mb_user),
             "candidate": is_candidate(mb_user), "sql": sql, "status": "error" if r["exception"] else "ok",
             "error": (r["exception"] or "")[:2000], "rows": int(r["result_rows"] or 0),
@@ -1626,7 +1642,7 @@ def item_cost(usage: dict) -> float:
 def evaluate_item(item_id: str) -> None:
     with LOCK:
         item = next((i for i in EVAL["items"] if i["id"] == item_id), None)
-        if not item or item_id in EVAL_PENDING:
+        if not item or item_id in EVAL_PENDING or not item.get("evaluable", True):
             return
         EVAL_PENDING.add(item_id)
         item["eval_error"] = None
@@ -1666,7 +1682,7 @@ def auto_candidates() -> list[dict]:
     out = []
     by_user: dict[int, list] = {}
     for i in EVAL["items"]:
-        if i["candidate"]:
+        if i["candidate"] and i.get("evaluable", True):
             by_user.setdefault(i["mb_user"], []).append(i)
     for items in by_user.values():
         latest = items[-1]
@@ -1715,6 +1731,8 @@ def live_fragment() -> str:
             when = time.strftime("%H:%M:%S", time.gmtime(i["ts"]))
             status = (f"<span class='badge error'>error</span>" if i["status"] == "error"
                       else f"<span class='badge ready'>{i['rows']:,} rows</span>")
+            if not i.get("evaluable", True):
+                status += f" <span class='badge stopped'>{e(i.get('kind', '').upper())} · not evaluated</span>"
             if i["id"] in EVAL_PENDING:
                 verdict = "<p class='muted'>evaluating…</p>"
             elif i.get("evaluation"):
@@ -1723,7 +1741,7 @@ def live_fragment() -> str:
                 verdict = f"<div class='flash err'>{e(i['eval_error'])}</div>"
             else:
                 verdict = ""
-            button = ("" if i["id"] in EVAL_PENDING else
+            button = ("" if i["id"] in EVAL_PENDING or not i.get("evaluable", True) else
                       f"<form class='inline' method='post' action='{P}/live/eval/{e(i['id'])}'>"
                       f"<button class='sec'>{'re-evaluate' if i.get('evaluation') else 'evaluate'}</button></form>")
             err = f"<pre class='mono' style='white-space:pre-wrap'>{e(i['error'][:600])}</pre>" if i["status"] == "error" else ""
@@ -1750,7 +1768,8 @@ def live_page(request: Request):
 <form class='inline' method='post' action='{P}/live/reset' onsubmit="return confirm('Clear the query list?')"><button class='sec'>Clear list</button></form>
 </div>
 <p class='muted'>Model: Claude Sonnet 5.5 (effort low). Auto mode evaluates a candidate's newest SQL query when it changed and at least {EVAL_COOLDOWN} s
-passed since their previous evaluation. Only users created on the admin page are evaluated automatically.</p></section>
+passed since their previous evaluation. Only users created on the admin page are evaluated automatically.
+DESCRIBE / EXPLAIN / SHOW and other non-SELECT queries are listed but never sent to the model.</p></section>
 <div id='live'>{live_fragment()}</div>"""
     js = f"""
 let ver = {EVAL.get('version', 0)};
@@ -1788,8 +1807,11 @@ def live_fragment_route(request: Request):
 def live_eval(request: Request, item_id: str):
     if (r := guard(request, post=True)):
         return r
-    if not any(i["id"] == item_id for i in EVAL["items"]):
+    item = next((i for i in EVAL["items"] if i["id"] == item_id), None)
+    if not item:
         return RedirectResponse(f"{P}/live?err={quote('Query not found')}", status_code=303)
+    if not item.get("evaluable", True):
+        return RedirectResponse(f"{P}/live?err={quote('Only SELECT queries are evaluated')}", status_code=303)
     start_thread(evaluate_item, item_id)
     time.sleep(0.3)
     return RedirectResponse(f"{P}/live", status_code=303)

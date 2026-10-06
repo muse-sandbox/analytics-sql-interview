@@ -84,6 +84,9 @@ How it works:
   - at most 150 calls/h and 800/day.
   - The key lives in `/opt/interview/ctl/anthropic_api_key` (root 600). It is never mounted into a
     container, and the admin cannot change the model or the instructions.
+- **Only data queries are evaluated:** `SELECT` / `WITH`, by `query_kind` or, for queries that failed
+  before parsing, by the first keyword. `DESCRIBE`, `EXPLAIN`, `SHOW`, `EXISTS`, `SET` … appear
+  in the list marked "not evaluated" and never reach the model.
 - **Auto mode** (default on): a candidate's newest SQL is evaluated when it changed and ≥ 60 s
   passed since their previous evaluation. Any query can be (re-)evaluated by hand. The list
   resets on every Start and Wipe.
