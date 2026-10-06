@@ -1,4 +1,4 @@
-<!-- Interview ClickHouse: small footprint, no log files, no system log tables. -->
+<!-- Interview ClickHouse: small footprint, no log files, no system log tables except a 1-day query_log. -->
 <clickhouse>
     <logger>
         <level>warning</level>
@@ -7,8 +7,14 @@
         <errorlog remove="1"/>
     </logger>
 
-    <!-- System log tables are the only thing that grows on its own; drop them all. -->
-    <query_log remove="1"/>
+    <!-- System log tables are the only thing that grows on its own; drop all but query_log. -->
+    <!-- the only system log kept: candidates' queries for the live evaluation (1 day, finished/failed only) -->
+    <query_log replace="1">
+        <database>system</database>
+        <table>query_log</table>
+        <engine>ENGINE = MergeTree PARTITION BY event_date ORDER BY event_time TTL event_date + INTERVAL 1 DAY DELETE</engine>
+        <flush_interval_milliseconds>2000</flush_interval_milliseconds>
+    </query_log>
     <query_thread_log remove="1"/>
     <query_views_log remove="1"/>
     <query_metric_log remove="1"/>

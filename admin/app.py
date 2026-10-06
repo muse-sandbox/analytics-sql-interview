@@ -7,7 +7,9 @@ One small web app behind nginx at /iv-admin/ (own login) that
     ClickHouse or given explicitly;
   * issues Metabase users with random login/password for candidates;
   * keeps interview samples (tables + candidate task + interviewer readme) on disk and loads
-    them on start; the active sample's task is a public page /iv-task/<token>/.
+    them on start; the active sample's task is a public page /iv-task/<token>/;
+  * live evaluation: watches the candidates' queries in ClickHouse's query_log and has Claude
+    assess them against the task and the interviewer notes (/iv-admin/live).
 
 Metabase is set up automatically on first start (admin user + the ClickHouse connection),
 so a fresh user can query the `interview` database right away.
@@ -244,6 +246,7 @@ def do_up(hours: int, resume: bool = False, sample: str | None = None) -> None:
             set_stack(phase="starting", message="starting containers", token=token,
                       task_token=secrets.token_urlsafe(24), active_sample=None,
                       auto_stop_at=(time.time() + hours * 3600) if hours else None)
+            eval_reset()
             cfg = secrets_cfg()
             ctl("up", site_url=f"{PUBLIC_BASE}/m/{token}/", ch_loader_password=cfg["ch_loader_password"],
                 ch_metabase_password=cfg["ch_metabase_password"])
@@ -275,6 +278,7 @@ def do_down(wipe: bool) -> None:
         if wipe:
             for name in ("metabase.json", "candidates.json"):
                 (STATE / name).unlink(missing_ok=True)
+            eval_reset()
             MB_SESSION.clear()
             for item in UPLOADS.iterdir():
                 if item.is_file():
@@ -775,6 +779,10 @@ def index(request: Request):
 """
     if st["url"]:
         stack_html += f"<p>Metabase URL (new on every start):</p>{copy_block('mburl', st['url'])}"
+    if phase == "ready":
+        n_eval = len(EVAL["items"])
+        stack_html += (f"<p><a href='{P}/live'><button type='button'>Live evaluation →</button></a> "
+                       f"<span class='muted'>{n_eval} candidate queries so far</span></p>")
     if st["task_url"]:
         stack_html += (f"<p>Task page for the candidate — <b>{e(st['sample'])}</b> "
                        f"(<a href='{e(st['task_url'])}' target='_blank'>open</a>):</p>{copy_block('taskurl', st['task_url'])}")
@@ -1504,3 +1512,302 @@ def sample_load(request: Request, slug: str):
     except Exception as exc:
         return back(err=f"Could not load the sample: {exc}", anchor="#samples")
     return back(msg="Loaded: " + ", ".join(loaded), anchor="#samples")
+
+
+# ---------------------------------------------------------------- live evaluation
+#
+# While the stack is ready, a background loop reads the candidates' SQL from ClickHouse's
+# system.query_log (user `metabase`; Metabase prefixes every query with
+# "-- Metabase:: userID: N queryType: native ..."), including failed ones. For a query worth
+# evaluating it re-runs it as the same read-only user capped at 100 rows, builds a prompt
+# (active sample's task + interviewer notes, cached; the query, its result or error, the previous
+# verdict) and asks the controller to call Claude (`evaluate` verb — the API key never enters
+# this container). Results show on /iv-admin/live, refreshed every few seconds.
+# Auto mode evaluates a candidate's newest native query when the SQL changed and at least
+# EVAL_COOLDOWN seconds passed since their previous evaluation; any query can be evaluated by hand.
+
+EVAL_FILE = "evaluations.json"
+EVAL_COOLDOWN = 60
+EVAL_KEEP = 400
+RESULT_ROWS = 100
+PRICES = {"input": 2.0, "cache_read": 0.2, "cache_write": 2.5, "output": 10.0}  # $ per 1M tokens, Sonnet 5.5
+MB_HEADER = re.compile(r"^\s*--\s*Metabase::([^\n]*)\n?")
+EVAL: dict = jload(EVAL_FILE, {"items": [], "last_ts": 0, "auto": True, "version": 0})
+EVAL_PENDING: set = set()
+
+
+def eval_save() -> None:
+    with LOCK:
+        EVAL["items"] = EVAL["items"][-EVAL_KEEP:]
+        EVAL["version"] = EVAL.get("version", 0) + 1
+        jsave(EVAL_FILE, EVAL)
+
+
+def eval_reset() -> None:
+    with LOCK:
+        EVAL.update(items=[], last_ts=0, version=EVAL.get("version", 0) + 1)
+        jsave(EVAL_FILE, EVAL)
+
+
+def normalize_sql(sql: str) -> str:
+    return re.sub(r"\s+", " ", sql).strip().rstrip(";").lower()
+
+
+def candidate_label(mb_user_id: int) -> str:
+    for u in jload("candidates.json", []):
+        if u["id"] == mb_user_id:
+            return u.get("note") or u["email"]
+    creds = jload("metabase.json", {})
+    return "Metabase admin" if creds.get("admin_id") == mb_user_id or mb_user_id == 1 else f"Metabase user {mb_user_id}"
+
+
+def is_candidate(mb_user_id: int) -> bool:
+    return any(u["id"] == mb_user_id for u in jload("candidates.json", []))
+
+
+def poll_query_log() -> int:
+    since = int(EVAL.get("last_ts") or 0)
+    rows = ch_json(
+        "SELECT toUnixTimestamp64Micro(event_time_microseconds) AS ts, query_id, toString(type) AS kind, "
+        "query, exception, result_rows, query_duration_ms "
+        "FROM system.query_log "
+        f"WHERE event_date >= yesterday() AND user = 'metabase' AND type != 'QueryStart' "
+        f"AND toUnixTimestamp64Micro(event_time_microseconds) > {since} "
+        "AND position(query, '-- Metabase::') > 0 "
+        "ORDER BY ts LIMIT 500")["data"]
+    added = 0
+    for r in rows:
+        EVAL["last_ts"] = max(EVAL.get("last_ts") or 0, int(r["ts"]))
+        m = MB_HEADER.match(r["query"])
+        if not m:
+            continue
+        header = m.group(1)
+        uid = re.search(r"userID:\s*(\d+)", header)
+        qtype = re.search(r"queryType:\s*(\w+)", header)
+        if not uid or (qtype and qtype.group(1).lower() != "native"):
+            continue
+        sql = r["query"][m.end():].strip()
+        if not sql:
+            continue
+        mb_user = int(uid.group(1))
+        EVAL["items"].append({
+            "id": r["query_id"], "ts": int(r["ts"]) / 1e6, "mb_user": mb_user, "who": candidate_label(mb_user),
+            "candidate": is_candidate(mb_user), "sql": sql, "status": "error" if r["exception"] else "ok",
+            "error": (r["exception"] or "")[:2000], "rows": int(r["result_rows"] or 0),
+            "ms": int(r["query_duration_ms"] or 0), "evaluation": None, "eval_error": None, "cost": None,
+        })
+        added += 1
+    if rows:
+        eval_save()
+    return added
+
+
+def run_sample(sql: str) -> str:
+    """Re-run a candidate's query as their own read-only user, first RESULT_ROWS rows as text."""
+    cfg = secrets_cfg()
+    res = httpx.post(CH_URL + "/", params={
+        "database": CH_DB, "default_format": "TabSeparatedWithNamesAndTypes", "max_result_rows": str(RESULT_ROWS),
+        "result_overflow_mode": "break", "max_execution_time": "20",
+    }, content=sql.encode(), auth=("metabase", cfg["ch_metabase_password"]), timeout=40)
+    if res.status_code != 200:
+        return "(re-running the query failed: " + res.text.strip()[:500] + ")"
+    lines = res.text.splitlines()
+    head, body = lines[:2], lines[2:2 + RESULT_ROWS]
+    cut = lambda line: "\t".join(c if len(c) <= 80 else c[:77] + "..." for c in line.split("\t"))
+    text = "\n".join(cut(l) for l in head + body)
+    more = "" if len(lines) - 2 <= RESULT_ROWS else f"\n... (output cut at {RESULT_ROWS} rows)"
+    return text[:30000] + more
+
+
+def item_cost(usage: dict) -> float:
+    return sum(usage.get(k, 0) * p for k, p in PRICES.items()) / 1e6
+
+
+def evaluate_item(item_id: str) -> None:
+    with LOCK:
+        item = next((i for i in EVAL["items"] if i["id"] == item_id), None)
+        if not item or item_id in EVAL_PENDING:
+            return
+        EVAL_PENDING.add(item_id)
+        item["eval_error"] = None
+    eval_save()
+    try:
+        meta = sample_meta(STACK.get("active_sample") or "")
+        stable = ("No interview sample is active: judge the query on its own merits." if not meta else
+                  f"# Task given to the candidate\n\n{meta['task']}\n\n# Interviewer's private notes\n\n{meta['readme']}")
+        previous = [i for i in EVAL["items"] if i["mb_user"] == item["mb_user"] and i.get("evaluation")
+                    and i["ts"] < item["ts"]]
+        first_ts = min(i["ts"] for i in EVAL["items"] if i["mb_user"] == item["mb_user"])
+        parts = [f"Candidate: {item['who']}. Minutes since their first query: {int((item['ts'] - first_ts) // 60)}."]
+        if previous:
+            prev = previous[-1]
+            parts.append(f"Previous evaluated query:\n```sql\n{prev['sql'][:6000]}\n```\n"
+                         f"Its verdict: {prev['evaluation'].splitlines()[0][:300]}")
+        parts.append(f"Current query:\n```sql\n{item['sql'][:20000]}\n```")
+        if item["status"] == "error":
+            parts.append(f"It failed with:\n```\n{item['error'][:2000]}\n```")
+        else:
+            parts.append(f"It returned {item['rows']} rows. First rows (tab-separated, names and types first):\n"
+                         f"```\n{run_sample(item['sql'])}\n```")
+        reply = ctl("evaluate", timeout=240, stable=stable, dynamic="\n\n".join(parts))
+        item["evaluation"] = reply["text"] or "(empty answer)"
+        item["cost"] = round(item_cost(reply.get("usage", {})), 4)
+        item["usage"] = reply.get("usage", {})
+        item["eval_at"] = time.time()
+    except Exception as exc:
+        item["eval_error"] = str(exc)[:1000]
+    finally:
+        EVAL_PENDING.discard(item_id)
+        eval_save()
+
+
+def auto_candidates() -> list[dict]:
+    """Newest native query per candidate that deserves an automatic evaluation."""
+    out = []
+    by_user: dict[int, list] = {}
+    for i in EVAL["items"]:
+        if i["candidate"]:
+            by_user.setdefault(i["mb_user"], []).append(i)
+    for items in by_user.values():
+        latest = items[-1]
+        if latest.get("evaluation") or latest["id"] in EVAL_PENDING or latest.get("eval_error"):
+            continue
+        done = [i for i in items if i.get("evaluation")]
+        if done and normalize_sql(done[-1]["sql"]) == normalize_sql(latest["sql"]):
+            continue
+        if done and time.time() - done[-1].get("eval_at", 0) < EVAL_COOLDOWN:
+            continue
+        out.append(latest)
+    return out
+
+
+def live_loop() -> None:
+    while True:
+        time.sleep(5)
+        if STACK.get("phase") != "ready" or not ch_up():
+            continue
+        try:
+            poll_query_log()
+            if EVAL.get("auto"):
+                for item in auto_candidates():
+                    start_thread(evaluate_item, item["id"])
+        except Exception:
+            pass
+
+
+@app.on_event("startup")
+def start_live_loop() -> None:
+    start_thread(live_loop)
+
+
+def live_fragment() -> str:
+    items = list(reversed(EVAL["items"]))
+    if not items:
+        return "<p class='muted'>No candidate queries yet. They appear here a few seconds after a query runs in Metabase.</p>"
+    total = sum(i.get("cost") or 0 for i in items)
+    groups: dict[str, list] = {}
+    for i in items:
+        groups.setdefault(i["who"], []).append(i)
+    html_parts = [f"<p class='muted'>{len(items)} queries · evaluations so far ≈ ${total:.2f}</p>"]
+    for who, rows in groups.items():
+        html_parts.append(f"<section><h2>{e(who)}</h2>")
+        for i in rows[:25]:
+            when = time.strftime("%H:%M:%S", time.gmtime(i["ts"]))
+            status = (f"<span class='badge error'>error</span>" if i["status"] == "error"
+                      else f"<span class='badge ready'>{i['rows']:,} rows</span>")
+            if i["id"] in EVAL_PENDING:
+                verdict = "<p class='muted'>evaluating…</p>"
+            elif i.get("evaluation"):
+                verdict = f"<div class='md'>{render_md(i['evaluation'])}</div><p class='muted'>≈ ${i.get('cost') or 0:.3f}</p>"
+            elif i.get("eval_error"):
+                verdict = f"<div class='flash err'>{e(i['eval_error'])}</div>"
+            else:
+                verdict = ""
+            button = ("" if i["id"] in EVAL_PENDING else
+                      f"<form class='inline' method='post' action='{P}/live/eval/{e(i['id'])}'>"
+                      f"<button class='sec'>{'re-evaluate' if i.get('evaluation') else 'evaluate'}</button></form>")
+            err = f"<pre class='mono' style='white-space:pre-wrap'>{e(i['error'][:600])}</pre>" if i["status"] == "error" else ""
+            html_parts.append(
+                f"<div style='border-top:1px solid var(--line);padding:10px 0'>"
+                f"<div class='row'><b>{when} UTC</b> {status} <span class='muted'>{i['ms']} ms</span> {button}</div>"
+                f"<details><summary>SQL</summary><pre class='mono' style='white-space:pre-wrap'>{e(i['sql'])}</pre></details>"
+                f"{err}{verdict}</div>")
+        html_parts.append("</section>")
+    return "".join(html_parts)
+
+
+@app.get(P + "/live")
+def live_page(request: Request):
+    if (r := guard(request)):
+        return r
+    auto = EVAL.get("auto", True)
+    body = f"""
+<div class='row' style='justify-content:space-between'><h1>Live evaluation</h1><a href="{P}/">← back</a></div>
+{flash(request)}
+<section><div class='row'>
+<form class='inline' method='post' action='{P}/live/auto'><input type='hidden' name='on' value='{0 if auto else 1}'>
+<button class='{"sec" if auto else ""}'>{'Auto-evaluation is ON — turn off' if auto else 'Auto-evaluation is OFF — turn on'}</button></form>
+<form class='inline' method='post' action='{P}/live/reset' onsubmit="return confirm('Clear the query list?')"><button class='sec'>Clear list</button></form>
+</div>
+<p class='muted'>Model: Claude Sonnet 5.5 (effort low). Auto mode evaluates a candidate's newest SQL query when it changed and at least {EVAL_COOLDOWN} s
+passed since their previous evaluation. Only users created on the admin page are evaluated automatically.</p></section>
+<div id='live'>{live_fragment()}</div>"""
+    js = f"""
+let ver = {EVAL.get('version', 0)};
+setInterval(async () => {{
+  try {{
+    const r = await fetch('{P}/live/version', {{credentials: 'same-origin'}});
+    if (r.status === 401) {{ location.href = '{P}/login'; return; }}
+    const v = (await r.json()).version;
+    if (v !== ver) {{
+      const open = [...document.querySelectorAll('#live details[open]')].length;
+      const f = await fetch('{P}/live/fragment', {{credentials: 'same-origin'}});
+      if (open === 0) {{ document.getElementById('live').innerHTML = await f.text(); ver = v; }}
+    }}
+  }} catch (e) {{}}
+}}, 4000);
+"""
+    return page("Live evaluation", body, js, extra_css=MD_CSS)
+
+
+@app.get(P + "/live/version")
+def live_version(request: Request):
+    if not authed(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    return {"version": EVAL.get("version", 0)}
+
+
+@app.get(P + "/live/fragment")
+def live_fragment_route(request: Request):
+    if not authed(request):
+        return Response("", status_code=401)
+    return HTMLResponse(live_fragment())
+
+
+@app.post(P + "/live/eval/{item_id}")
+def live_eval(request: Request, item_id: str):
+    if (r := guard(request, post=True)):
+        return r
+    if not any(i["id"] == item_id for i in EVAL["items"]):
+        return RedirectResponse(f"{P}/live?err={quote('Query not found')}", status_code=303)
+    start_thread(evaluate_item, item_id)
+    time.sleep(0.3)
+    return RedirectResponse(f"{P}/live", status_code=303)
+
+
+@app.post(P + "/live/auto")
+def live_auto(request: Request, on: str = Form("1")):
+    if (r := guard(request, post=True)):
+        return r
+    with LOCK:
+        EVAL["auto"] = on == "1"
+    eval_save()
+    return RedirectResponse(f"{P}/live", status_code=303)
+
+
+@app.post(P + "/live/reset")
+def live_reset(request: Request):
+    if (r := guard(request, post=True)):
+        return r
+    eval_reset()
+    return RedirectResponse(f"{P}/live", status_code=303)

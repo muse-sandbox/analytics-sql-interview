@@ -10,7 +10,8 @@
 #
 # Layout on the server:
 #   /opt/interview/                 root 755   compose.yml, clickhouse/, metabase/ (read-only configs)
-#   /opt/interview/ctl/             root 700   controller code + its secrets (Postgres password, stack.env)
+#   /opt/interview/ctl/             root 700   controller code + venv + its secrets (Postgres password,
+#                                              stack.env, anthropic_api_key — put there by hand)
 #   /opt/interview/admin/           root 755   admin image sources + its compose.yml
 #   /opt/interview/admin.env        root 600   admin login hash + public address (container env)
 #   /opt/interview/admin_credentials.txt  root 600   the admin password in plain text
@@ -53,6 +54,9 @@ install -m 644 "$SRC/clickhouse/config.xml" "$SRC/clickhouse/users.xml" "$DEST/c
 install -m 644 "$SRC/metabase/log4j2.xml" "$DEST/metabase/"
 install -m 644 "$SRC/admin/app.py" "$SRC/admin/requirements.txt" "$SRC/admin/Dockerfile" "$SRC/admin/compose.yml" "$DEST/admin/"
 install -m 700 "$SRC/ctl/interview_ctl.py" "$DEST/ctl/interview_ctl.py"
+# the controller's own venv: the Anthropic SDK for the live evaluation (`evaluate` verb)
+[ -x "$DEST/ctl/.venv/bin/python" ] || python3 -m venv "$DEST/ctl/.venv"
+"$DEST/ctl/.venv/bin/pip" install -q --upgrade pip "anthropic>=1.0"
 install -m 750 "$SRC/bin/iv" /usr/local/bin/iv
 
 for sample in "$SRC"/samples/*/; do

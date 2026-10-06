@@ -5,7 +5,7 @@ Requires=docker.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /opt/interview/ctl/interview_ctl.py
+ExecStart=/opt/interview/ctl/.venv/bin/python /opt/interview/ctl/interview_ctl.py
 Environment=DOCKER_CONFIG=/opt/interview/ctl/docker
 RuntimeDirectory=interview-ctl
 RuntimeDirectoryMode=0750
@@ -13,7 +13,7 @@ Restart=on-failure
 RestartSec=3
 UMask=0077
 LogLevelMax=warning
-# It needs Docker, iptables and its own state dir — nothing else is writable for it.
+# It needs Docker, iptables, its own state dir and (for `evaluate`) HTTPS to the Anthropic API.
 NoNewPrivileges=yes
 ProtectSystem=strict
 ReadWritePaths=/opt/interview/ctl /run

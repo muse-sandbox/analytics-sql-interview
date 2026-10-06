@@ -59,7 +59,8 @@ and saved interview "samples" (tables + candidate task + interviewer notes). Hum
 `save-sample` must be on the server: `scp` them to `/root/` first and delete them afterwards.
 
 **Typical interview prep:** `iv status` → `iv start --sample <slug> --hours 4` → `iv user "<candidate name>"`
-→ give the user the printed URL / login / password / task link. **Afterwards:** `iv stop`, or
+→ give the user the printed URL / login / password / task link. During the interview, the
+interviewer watches `/iv-admin/live`: Claude evaluates each candidate query (README § "Live evaluation"). **Afterwards:** `iv stop`, or
 `iv wipe --yes` only if the user asks.
 
 ## Creating a new sample (interview case)
@@ -134,6 +135,12 @@ Layout:
   - upload, disk, text and attachment limits;
   - attachment type whitelist;
   - same-origin check on every POST.
+- **The Anthropic key stays root-only** (`/opt/interview/ctl/anthropic_api_key`).
+  - Only the controller's `evaluate` verb uses it.
+  - Model, effort and instructions are fixed in `ctl/interview_ctl.py`, and calls are
+    rate-limited.
+  - Never mount the key into a container, print it, or move prompt control into the admin.
+  - The candidates' user must not be able to read `system.query_log`.
 - **Referrer policy stays `same-origin`.** With `no-referrer`, browsers send `Origin: null` on form
   POSTs and every browser login fails as "cross-origin".
 

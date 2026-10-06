@@ -61,6 +61,42 @@ Using samples:
   Re-saving with "overwrite" replaces the data and keeps the existing attachments. On a sample's page
   you can read the readme, preview the task, edit both texts and delete the sample.
 
+## Live evaluation (Claude)
+
+`/iv-admin/live` (button on the main page while the stack is ready) shows every SQL query the
+candidates run in Metabase, failed ones included, each with Claude's assessment:
+- the status (on track / partially / wrong / execution error);
+- which traps from the interviewer notes are handled or missed;
+- concrete mistakes;
+- a question to ask the candidate next.
+
+How it works:
+- **Collecting queries.** ClickHouse keeps `system.query_log` for 1 day, and only for the
+  candidates' user (`metabase`), finished and failed queries only. The admin reads it every 5 s
+  and recognises Metabase's `-- Metabase:: userID: N queryType: native` header.
+- **The prompt.** For a query to evaluate, the admin re-runs it as the candidate's read-only
+  user, capped at 100 rows (an error is sent as is). The prompt holds:
+  - the active sample's task.md and readme.md (prompt-cached);
+  - the query and its result or error;
+  - the previous verdict.
+- **The call.** The admin asks the controller's `evaluate` verb to call the Anthropic API:
+  - model Claude Sonnet 5.5, effort `low`, refusal fallback `default`;
+  - at most 150 calls/h and 800/day.
+  - The key lives in `/opt/interview/ctl/anthropic_api_key` (root 600). It is never mounted into a
+    container, and the admin cannot change the model or the instructions.
+- **Auto mode** (default on): a candidate's newest SQL is evaluated when it changed and ≥ 60 s
+  passed since their previous evaluation. Any query can be (re-)evaluated by hand. The list
+  resets on every Start and Wipe.
+
+Cost, measured on a simulated session of 4 queries on MU data analyst task #1:
+- the first call is ~$0.016, because it writes the ~5k-token task + notes into the cache;
+- each later call is $0.005–0.009;
+- an interview with 20–40 evaluated queries costs about $0.15–0.35.
+- The cache lives 5 minutes. After a longer pause, the next call writes it again (~$0.01 extra).
+
+Put the key in place (it is never shown):
+`ssh -t <host> 'umask 077; read -rsp "Anthropic API key: " k; echo; printf %s "$k" > /opt/interview/ctl/anthropic_api_key'`
+
 ## What the candidate can do
 
 ClickHouse user `metabase`: `readonly=2`, `SELECT, SHOW ON interview.*` only (no DDL, no `file()` /
@@ -116,7 +152,8 @@ network beyond the stack.
   - `loader` (used by the admin) works only with tables in `interview`, plus `file()` inside
     `user_files` (the uploads mount). No `url`/`remote`/`s3`/`mysql`/…, no dictionaries,
     no URL/File engines, no other databases.
-  - `metabase` (used by candidates) has read-only `SELECT, SHOW ON interview.*`.
+  - `metabase` (used by candidates) has read-only `SELECT, SHOW ON interview.*`. It cannot read
+    `system.query_log`; only `loader` can.
 - **Admin app.**
   - Loading from a URL has been removed; only file uploads remain.
   - Limits:
