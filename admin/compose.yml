@@ -1,0 +1,44 @@
+# The admin web app, always on. It runs as an unprivileged user in a read-only container with
+# no capabilities and no Docker socket. It sees only the project's own data directories, and
+# the stack controller's unix socket is its only way to act on the host. It sits on the
+# stack network, so the firewall rules for br-interview also stop it from opening connections
+# outside the project.
+name: interview-admin
+
+services:
+  admin:
+    build: .
+    image: interview-admin:local
+    env_file: /opt/interview/admin.env
+    environment:
+      IV_HOME: /data
+      IV_CH_URL: http://clickhouse:8123
+      IV_MB_URL: http://metabase:3000
+      IV_CTL_SOCKET: /run/ctl/ctl.sock
+      TMPDIR: /data/uploads/.tmp
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: 0.5
+    volumes:
+      - /opt/interview/state:/data/state
+      - /opt/interview/uploads:/data/uploads
+      - /opt/interview/samples:/data/samples
+      - /run/interview-ctl:/run/ctl
+    ports:
+      - "127.0.0.1:18090:18090"
+    networks: [iv]
+    restart: unless-stopped
+    logging:
+      driver: local
+      options: {max-size: "1m", max-file: "1", compress: "false"}
+
+networks:
+  iv:
+    external: true
+    name: interview_net

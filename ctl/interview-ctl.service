@@ -1,0 +1,30 @@
+[Unit]
+Description=Interview stack controller (the only Docker-facing process; serves the admin container)
+After=network-online.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/interview/ctl/interview_ctl.py
+Environment=DOCKER_CONFIG=/opt/interview/ctl/docker
+RuntimeDirectory=interview-ctl
+RuntimeDirectoryMode=0750
+Restart=on-failure
+RestartSec=3
+UMask=0077
+LogLevelMax=warning
+# It needs Docker, iptables and its own state dir — nothing else is writable for it.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/interview/ctl /run
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=no
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

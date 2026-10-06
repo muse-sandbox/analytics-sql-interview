@@ -5,7 +5,7 @@ server next to other services, is started only for an interview, and is managed 
 admin page:
 
 ```
-https://<server>/iv-admin/          admin (own login; credentials: /opt/interview/state/admin_credentials.txt, root only)
+https://<server>/iv-admin/          admin (own login; credentials: /opt/interview/admin_credentials.txt, root only)
 https://<server>/m/<token>/         Metabase for the candidate; <token> is new on every start
 https://<server>/iv-task/<token>/   the active sample's task for the candidate
 ```
@@ -16,7 +16,7 @@ https://<server>/iv-task/<token>/   the active sample's task for the candidate
    It is ready in ~1–2 minutes; the very first start, or the first one after a wipe, takes longer
    because it sets up Metabase. Metabase is configured automatically: an admin user, the
    ClickHouse connection (`Interview ClickHouse` → database `interview`) and SQL access for all users.
-2. **Load a CSV / TSV**: upload a file or paste a link (`.gz/.zst/.xz/.bz2/.lz4` are read as is).
+2. **Load a CSV / TSV**: upload a file, up to 1 GB (`.gz/.zst/.xz/.bz2/.lz4` are read as is).
    On the next page choose the format and delimiter, check the preview, then either keep the
    schema ClickHouse detected or write your own (one `column Type` per line, in the file's column
    order — names do not have to match the header). Set `ORDER BY` if you want, the number of
@@ -27,7 +27,8 @@ https://<server>/iv-task/<token>/   the active sample's task for the candidate
    checks that it can log in. The copy block holds the URL, login and password to send.
 4. After the interview: **Stop** removes the containers and keeps tables, users and questions on
    disk for the next start. **Stop and wipe data** also deletes the volumes, so the next start is a
-   fresh install. Stopped, the stack takes no RAM or CPU; only the admin itself runs (~75 MB).
+   fresh install. Stopped, the stack takes no RAM or CPU. Only two small processes keep running:
+   the admin container (~60 MB) and the controller (~15 MB).
 
 ## Samples (saved interview cases)
 
@@ -83,18 +84,77 @@ tmpfs) and none of its `system.*_log` tables. Metabase logs at `WARN` level to t
 Postgres has no log collector. nginx `access_log off` covers `/iv-admin/` and `/m/`. The admin logs
 nothing (`--no-access-log`, journald warnings only). Pending uploads are deleted after 24 h.
 
+## Security model
+
+The goal: someone who gets into the admin can do no more than what the admin offers inside this
+project. They cannot run commands on the host, read files outside the project, or reach the
+network beyond the stack.
+
+- **No Docker access in the admin.** The admin web app runs in its own container:
+  - user `10001` (`ivadmin`), read-only root filesystem, all capabilities dropped,
+    `no-new-privileges`, 256 MB / 0.5 CPU / 128 pids;
+  - no Docker socket;
+  - it sees only `/opt/interview/{state,uploads,samples}`, nothing else from the host.
+- **The controller is the only way to act on the host.** `ctl/interview_ctl.py` runs as root under
+  systemd and is the only process that talks to Docker.
+  - It listens on `/run/interview-ctl/ctl.sock` (`root:ivadmin 0660`).
+  - It accepts five requests: `up`, `down`, `ps`, `stats`, `logs`. Their parameters are checked
+    against regexes (site URL, 32-hex passwords, service name from a list), requests are capped
+    at 4 KB, and nothing reaches a shell.
+  - The systemd unit is hardened: `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`,
+    `NoNewPrivileges`.
+- **Stack containers.** ClickHouse, Metabase and Postgres run as non-root users (101, 2000, 70)
+  with a read-only root filesystem, no capabilities and `no-new-privileges`. They mount only
+  their own config files and volumes; ClickHouse also gets the uploads directory read-only.
+  ClickHouse has no published port.
+- **Network.** Every container sits on `interview_net` (bridge `br-interview`, `172.30.77.0/24`).
+  The controller keeps four iptables rules in `DOCKER-USER` and `INPUT`. Containers can talk to
+  each other and answer incoming connections. They cannot open new connections anywhere else:
+  the internet, the host's own services (ssh, SFTPGo, nginx) and the cloud metadata endpoint are
+  all closed. The only ways in are nginx → `127.0.0.1:18090` (admin) and `127.0.0.1:13000` (Metabase).
+- **ClickHouse users.**
+  - `loader` (used by the admin) works only with tables in `interview`, plus `file()` inside
+    `user_files` (the uploads mount). No `url`/`remote`/`s3`/`mysql`/…, no dictionaries,
+    no URL/File engines, no other databases.
+  - `metabase` (used by candidates) has read-only `SELECT, SHOW ON interview.*`.
+- **Admin app.**
+  - Loading from a URL has been removed; only file uploads remain.
+  - Limits:
+    - an upload — 1 GB;
+    - uploads + samples + ClickHouse tables together — 8 GB;
+    - task.md and readme.md — 200 KB each;
+    - attachments — 10 MB each, `png/jpg/jpeg/gif/webp/csv/txt/pdf` only, so no SVG or HTML;
+    - at most 50 samples.
+  - Markdown is rendered with raw HTML escaped and `javascript:` links refused.
+  - Every page sends CSP, `nosniff`, `no-referrer` and `DENY` framing headers. The public task
+    page sends `default-src 'none'`.
+- **Secrets on the host.** The plain admin password and the controller secrets (`ctl/`) are
+  root-only and are not mounted into any container.
+
+What admin access still allows, by design: start and stop the stack, load and drop tables,
+create and deactivate candidate users, manage samples, and see the Metabase admin login.
+Anything done as the Metabase admin stays inside the Metabase container, which has no host
+access and no network beyond the stack.
+
 ## Files
 
 | file | installed as |
 | --- | --- |
-| `compose.yml`, `clickhouse/*.xml`, `metabase/log4j2.xml` | `/opt/interview/…` |
-| `admin/app.py`, `admin/requirements.txt` | `/opt/interview/admin/` (venv `.venv`) |
-| `interview-admin.service` | `/etc/systemd/system/` (uvicorn on `127.0.0.1:18090`) |
+| `compose.yml`, `clickhouse/*.xml`, `metabase/log4j2.xml` | `/opt/interview/…` (root, read-only for containers) |
+| `admin/` (`app.py`, `Dockerfile`, `compose.yml`, `requirements.txt`) | `/opt/interview/admin/`, image `interview-admin:local`, project `interview-admin` (`restart: unless-stopped`) |
+| `ctl/interview_ctl.py`, `ctl/interview-ctl.service` | `/opt/interview/ctl/` (root 700), `/etc/systemd/system/` |
 | `nginx-interview.conf` | `/etc/nginx/snippets/muse-slop-interview.conf`, included from the `:443` server |
 
-State in `/opt/interview/state/` (0700): `admin.env` (scrypt hash of the admin password),
-`secrets.json` (Postgres/ClickHouse passwords), `stack.json` (phase, current token, timer),
-`metabase.json` (Metabase admin + db id) and `candidates.json`.
+On the server:
+
+| path | owner, mode | what it holds |
+| --- | --- | --- |
+| `/opt/interview/admin.env` | root 600 | admin login hash, public address |
+| `/opt/interview/admin_credentials.txt` | root 600 | the plain admin password |
+| `/opt/interview/ctl/` | root 700 | Postgres password, `stack.env` |
+| `/opt/interview/state/` | ivadmin 700 | `secrets.json` (ClickHouse passwords), `stack.json`, `metabase.json`, `candidates.json` |
+| `/opt/interview/samples/` | ivadmin 700 | samples |
+| `/opt/interview/uploads/` | ivadmin 711 | pending CSV uploads |
 
 The token check works like this: nginx `auth_request` calls `/_internal/mbcheck`, which is not
 reachable from outside. A token that does not match the current one, or a stack that is not
@@ -110,13 +170,13 @@ From a laptop with root ssh access to the server:
 
 `deploy.sh` copies the repository to the server and runs `install.sh` there. `install.sh` is
 idempotent. It keeps credentials, data, volumes and samples, validates nginx before the reload and
-restores the site file if validation fails. It expects nginx with `auth_request`, Docker with the
-compose plugin, and `python3-venv`. The nginx site file is `SITE` (default
+restores the site file if validation fails. It also retires the old host-run admin (systemd unit
+`interview-admin` and its venv) if present. It expects nginx with `auth_request`, Docker with the
+compose plugin, `python3` and iptables. The nginx site file is `SITE` (default
 `/etc/nginx/sites-available/muse-slop`), and the include line goes before its
 `# ---- SFTPGo ----` marker.
 
-The first install writes the admin login to `/opt/interview/state/admin_credentials.txt`
-(root only).
+The first install writes the admin login to `/opt/interview/admin_credentials.txt` (root only).
 
 ## Pitfalls already hit
 
@@ -128,3 +188,5 @@ The first install writes the admin login to `/opt/interview/state/admin_credenti
 - `background_pool_size=4` requires the `merge_tree` `number_of_free_entries_*` settings to be lowered too.
 - The docker `local` log driver refuses `max-file=1` unless `compress=false`.
 - nginx regex locations containing `{n,m}` must be quoted.
+- Metabase as a non-root user needs a writable `MB_PLUGINS_DIR` (a tmpfs here). Its entrypoint
+  switches users only when started as root.

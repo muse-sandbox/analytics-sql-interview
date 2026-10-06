@@ -13,7 +13,12 @@ Metabase is set up automatically on first start (admin user + the ClickHouse con
 so a fresh user can query the `interview` database right away.
 
 nginx asks GET /_internal/mbcheck (not proxied from outside) whether /m/<token>/ is current.
-State lives in $IV_HOME/state (root-only); nothing is logged to files.
+
+Isolation: this app runs in an unprivileged read-only container (see compose.yml next to it).
+It has no Docker access; starting/stopping goes through the controller's unix socket
+(ctl/interview_ctl.py), which accepts only a fixed set of validated verbs. The app reaches
+ClickHouse/Metabase by name on the stack network; it cannot fetch arbitrary URLs.
+State lives in $IV_HOME/state; nothing is logged to files.
 """
 from __future__ import annotations
 
@@ -27,8 +32,8 @@ import os
 import re
 import secrets
 import shutil
+import socket
 import string
-import subprocess
 import threading
 import time
 from pathlib import Path
@@ -36,7 +41,7 @@ from urllib.parse import quote, urlsplit
 
 import httpx
 from fastapi import FastAPI, File, Form, Request, UploadFile
-import markdown
+from markdown_it import MarkdownIt
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from starlette.concurrency import run_in_threadpool
 
@@ -50,13 +55,20 @@ ADMIN_HASH = os.environ["IV_ADMIN_HASH"]
 
 P = "/iv-admin"
 PROJECT = "interview"
-CH_URL = "http://127.0.0.1:18123"
-MB_URL = "http://127.0.0.1:13000"
+CH_URL = os.environ.get("IV_CH_URL", "http://clickhouse:8123")
+MB_URL = os.environ.get("IV_MB_URL", "http://metabase:3000")
+CTL_SOCKET = os.environ.get("IV_CTL_SOCKET", "/run/ctl/ctl.sock")
 CH_DB = "interview"
 MB_DB_NAME = "Interview ClickHouse"
 USER_DOMAIN = "interview.local"
 SESSION_TTL = 12 * 3600
-MAX_URL_DOWNLOAD = 2 * 1024**3
+MAX_UPLOAD = 1024**3                     # one uploaded file
+MAX_PROJECT_BYTES = 8 * 1024**3          # uploads + samples + ClickHouse tables together
+MAX_TEXT = 200 * 1024                    # task.md / readme.md
+MAX_ASSET = 10 * 1024**2
+MAX_SAMPLES = 50
+ASSET_TYPES = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif",
+               "webp": "image/webp", "csv": "text/csv", "txt": "text/plain", "pdf": "application/pdf"}
 UPLOAD_KEEP_S = 24 * 3600
 AUTO_STOP_CHOICES = {"2": "2 h", "4": "4 h", "8": "8 h", "24": "24 h", "0": "never"}
 FORMATS = {
@@ -71,6 +83,20 @@ UID = re.compile(r"^[0-9a-f]{32}$")
 KEEP_SUFFIXES = (".gz", ".zst", ".bz2", ".xz", ".lz4")
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+
+ADMIN_CSP = ("default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self'; "
+             "connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
+TASK_CSP = "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+
+
+@app.middleware("http")
+async def security_headers(request, call_next):
+    response = await call_next(request)
+    response.headers["Content-Security-Policy"] = TASK_CSP if request.url.path.startswith("/iv-task/") else ADMIN_CSP
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["X-Frame-Options"] = "DENY"
+    return response
 LOCK = threading.RLock()
 SESSIONS: dict[str, float] = {}
 FAILS: dict[str, list[float]] = {}
@@ -99,7 +125,7 @@ def secrets_cfg() -> dict:
     with LOCK:
         cfg = jload("secrets.json", None)
         if not cfg:
-            cfg = {k: secrets.token_hex(16) for k in ("pg_password", "ch_loader_password", "ch_metabase_password")}
+            cfg = {k: secrets.token_hex(16) for k in ("ch_loader_password", "ch_metabase_password")}
             jsave("secrets.json", cfg)
         return cfg
 
@@ -127,57 +153,40 @@ def metabase_url() -> str | None:
     return f"{PUBLIC_BASE}/m/{tok}/" if tok else None
 
 
-# ---------------------------------------------------------------- docker compose
+# ---------------------------------------------------------------- controller
 
-def write_env(token: str | None) -> None:
-    cfg = secrets_cfg()
-    site = f"{PUBLIC_BASE}/m/{token}/" if token else f"{PUBLIC_BASE}/m/stopped/"
-    path = STATE / "stack.env"
-    path.write_text(
-        f"PG_PASSWORD={cfg['pg_password']}\n"
-        f"CH_LOADER_PASSWORD={cfg['ch_loader_password']}\n"
-        f"CH_METABASE_PASSWORD={cfg['ch_metabase_password']}\n"
-        f"MB_SITE_URL={site}\n"
-    )
-    os.chmod(path, 0o600)
-
-
-def compose(*args: str, timeout: int = 900) -> str:
-    if not (STATE / "stack.env").exists():
-        write_env(STACK.get("token"))
-    cmd = ["docker", "compose", "-p", PROJECT, "-f", str(HOME / "compose.yml"),
-           "--env-file", str(STATE / "stack.env"), *args]
-    res = subprocess.run(cmd, cwd=HOME, capture_output=True, text=True, timeout=timeout)
-    if res.returncode:
-        raise RuntimeError((res.stderr or res.stdout).strip()[-2000:])
-    return res.stdout
+def ctl(verb: str, timeout: int = 900, **params) -> dict:
+    """One request to the host controller (the only thing that can run Docker)."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.settimeout(timeout)
+        sock.connect(CTL_SOCKET)
+        sock.sendall(json.dumps({"verb": verb, **params}).encode() + b"\n")
+        buf = b""
+        while not buf.endswith(b"\n"):
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+    reply = json.loads(buf or b"{}")
+    if not reply.get("ok"):
+        raise RuntimeError(reply.get("error") or "controller error")
+    return reply
 
 
 def containers() -> list[dict]:
     try:
-        out = compose("ps", "-a", "--format", "json", timeout=30).strip()
+        return ctl("ps", timeout=60)["containers"]
     except Exception:
         return []
-    if not out:
-        return []
-    items = json.loads(out) if out.startswith("[") else [json.loads(l) for l in out.splitlines() if l.strip()]
-    return [{"name": i.get("Name"), "service": i.get("Service"), "state": i.get("State"),
-             "status": i.get("Status")} for i in items]
 
 
 def container_stats() -> list[dict]:
     if time.time() - STATS_CACHE["at"] < 10:
         return STATS_CACHE["data"]
-    names = [c["name"] for c in containers() if c["state"] == "running"]
-    data = []
-    if names:
-        res = subprocess.run(["docker", "stats", "--no-stream", "--format",
-                              "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}", *names],
-                             capture_output=True, text=True, timeout=30)
-        for line in res.stdout.splitlines():
-            parts = line.split("\t")
-            if len(parts) == 3:
-                data.append({"name": parts[0], "cpu": parts[1], "mem": parts[2]})
+    try:
+        data = ctl("stats", timeout=60)["stats"]
+    except Exception:
+        data = []
     STATS_CACHE.update(at=time.time(), data=data)
     return data
 
@@ -202,8 +211,11 @@ def fmt_bytes(n) -> str:
 def dead_container_error() -> str | None:
     for c in containers():
         if c["state"] in ("exited", "dead"):
-            res = subprocess.run(["docker", "logs", "--tail", "15", c["name"]], capture_output=True, text=True, timeout=30)
-            tail = "\n".join(l for l in (res.stdout + res.stderr).splitlines() if not re.match(r"^\d+\. ", l))
+            try:
+                logs = ctl("logs", timeout=60, service=c["service"])["logs"]
+            except Exception as exc:
+                logs = str(exc)
+            tail = "\n".join(l for l in logs.splitlines() if not re.match(r"^\d+\. ", l))
             return f"container {c['service']} stopped: {c['status']}\n{tail[-1500:]}"
     return None
 
@@ -231,8 +243,9 @@ def do_up(hours: int, resume: bool = False, sample: str | None = None) -> None:
             set_stack(phase="starting", message="starting containers", token=token,
                       task_token=secrets.token_urlsafe(24), active_sample=None,
                       auto_stop_at=(time.time() + hours * 3600) if hours else None)
-            write_env(token)
-            compose("up", "-d", "--remove-orphans")
+            cfg = secrets_cfg()
+            ctl("up", site_url=f"{PUBLIC_BASE}/m/{token}/", ch_loader_password=cfg["ch_loader_password"],
+                ch_metabase_password=cfg["ch_metabase_password"])
         set_stack(message="waiting for ClickHouse")
         wait_for(lambda: httpx.get(CH_URL + "/ping", timeout=3).text.strip() == "Ok.", 180, "ClickHouse")
         ch(f"CREATE DATABASE IF NOT EXISTS `{CH_DB}`")
@@ -257,7 +270,7 @@ def do_down(wipe: bool) -> None:
     try:
         set_stack(phase="stopping", message="stopping containers", token=None, auto_stop_at=None,
                   task_token=None, active_sample=None)
-        compose("down", "--remove-orphans", *(["-v"] if wipe else []), timeout=300)
+        ctl("down", timeout=300, wipe=bool(wipe))
         if wipe:
             for name in ("metabase.json", "candidates.json"):
                 (STATE / name).unlink(missing_ok=True)
@@ -265,7 +278,6 @@ def do_down(wipe: bool) -> None:
             for item in UPLOADS.iterdir():
                 if item.is_file():
                     item.unlink()
-        write_env(None)
         set_stack(phase="stopped", message="data wiped" if wipe else "")
     except Exception as exc:
         set_stack(phase="error", message=f"stop failed: {exc}"[:2000])
@@ -304,6 +316,8 @@ def auto_stop_loop() -> None:
 @app.on_event("startup")
 def on_startup() -> None:
     UPLOADS.mkdir(exist_ok=True)
+    (UPLOADS / ".tmp").mkdir(exist_ok=True)
+    SAMPLES.mkdir(exist_ok=True)
     secrets_cfg()
     reconcile_on_boot()
     start_thread(auto_stop_loop)
@@ -427,6 +441,23 @@ def load_table(meta: dict, table: str, fmt: str, delim: str, nullable: bool, str
         ch(f"DROP TABLE IF EXISTS {loading}")
         raise
     return int(ch(f"SELECT count() FROM {target}").strip())
+
+
+def dir_bytes(path: Path) -> int:
+    return sum(f.stat().st_size for f in path.rglob("*") if f.is_file()) if path.exists() else 0
+
+
+def check_disk(extra: int = 0) -> None:
+    """Keep the whole project (uploads + samples + ClickHouse tables) under MAX_PROJECT_BYTES."""
+    used = dir_bytes(UPLOADS) + dir_bytes(SAMPLES)
+    if ch_up():
+        try:
+            used += int(ch("SELECT sum(total_bytes) FROM system.tables WHERE database = "
+                           + lit(CH_DB)).strip() or 0)
+        except Exception:
+            pass
+    if used + extra > MAX_PROJECT_BYTES:
+        raise ValueError(f"project disk limit: {fmt_bytes(used)} used of {fmt_bytes(MAX_PROJECT_BYTES)}")
 
 
 def drop_upload(uid: str) -> None:
@@ -801,8 +832,7 @@ def index(request: Request):
         tables_html += f"""
 <h2 style="margin-top:16px">Load a CSV / TSV</h2>
 <form method="post" action="{P}/tables/upload" enctype="multipart/form-data">
-<div class="row"><input type="file" name="file"> <span class="muted">or</span>
-<input type="url" name="url" placeholder="https://… link to the file" style="flex:1;min-width:240px"></div>
+<div class="row"><input type="file" name="file"> <span class="muted">up to 1 GB</span></div>
 <p class="muted">.gz / .zst / .xz / .bz2 / .lz4 are decompressed on the fly. Next step: format, schema and table name.</p>
 <button>Upload</button></form>"""
     else:
@@ -915,50 +945,31 @@ def stack_extend(request: Request):
 def _save_upload_file(src, uid: str, filename: str) -> dict:
     suffix = next((s for s in KEEP_SUFFIXES if filename.lower().endswith(s)), "")
     target = UPLOADS / f"{uid}{suffix}"
+    size = 0
     with open(target, "wb") as out:
-        shutil.copyfileobj(src, out, 1024 * 1024)
+        while chunk := src.read(1024 * 1024):
+            size += len(chunk)
+            if size > MAX_UPLOAD:
+                out.close()
+                target.unlink(missing_ok=True)
+                raise ValueError(f"file is larger than {fmt_bytes(MAX_UPLOAD)}")
+            out.write(chunk)
     os.chmod(target, 0o644)
     meta = {"name": filename, "file": target.name, "size": target.stat().st_size, "created": time.time()}
     (UPLOADS / f"{uid}.json").write_text(json.dumps(meta))
     return meta
 
 
-def _download(url: str, uid: str) -> dict:
-    parts = urlsplit(url)
-    if parts.scheme not in ("http", "https"):
-        raise ValueError("only http(s) links are supported")
-    filename = parts.path.rsplit("/", 1)[-1] or "download.csv"
-    suffix = next((s for s in KEEP_SUFFIXES if filename.lower().endswith(s)), "")
-    target = UPLOADS / f"{uid}{suffix}"
-    size = 0
-    with httpx.stream("GET", url, follow_redirects=True, timeout=httpx.Timeout(60, read=600)) as res:
-        res.raise_for_status()
-        with open(target, "wb") as out:
-            for chunk in res.iter_bytes(1024 * 1024):
-                size += len(chunk)
-                if size > MAX_URL_DOWNLOAD:
-                    out.close()
-                    target.unlink(missing_ok=True)
-                    raise ValueError("file is larger than 2 GB")
-                out.write(chunk)
-    os.chmod(target, 0o644)
-    meta = {"name": filename, "file": target.name, "size": size, "created": time.time()}
-    (UPLOADS / f"{uid}.json").write_text(json.dumps(meta))
-    return meta
-
-
 @app.post(P + "/tables/upload")
-async def tables_upload(request: Request, file: UploadFile | None = File(None), url: str = Form("")):
+async def tables_upload(request: Request, file: UploadFile | None = File(None)):
     if (r := guard(request, post=True)):
         return r
     uid = secrets.token_hex(16)
     try:
-        if file is not None and file.filename:
-            await run_in_threadpool(_save_upload_file, file.file, uid, file.filename)
-        elif url.strip():
-            await run_in_threadpool(_download, url.strip(), uid)
-        else:
-            return back(err="Choose a file or paste a link", anchor="#tables")
+        if not (file is not None and file.filename):
+            return back(err="Choose a file", anchor="#tables")
+        check_disk(file.size or 0)
+        await run_in_threadpool(_save_upload_file, file.file, uid, file.filename)
     except Exception as exc:
         drop_upload(uid)
         return back(err=f"Upload failed: {exc}", anchor="#tables")
@@ -1121,8 +1132,13 @@ def users_deactivate(request: Request, user_id: int = Form(...)):
 # Loading a sample (on start or into a running stack) recreates its tables, makes it the active
 # sample (its task becomes the /iv-task/ page) and saves a Metabase question that links to the task.
 
+MD = MarkdownIt("commonmark", {"html": False, "linkify": False}).enable(["table", "strikethrough"])
 SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,59}$")
 ASSET = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,120}$")
+
+
+def asset_ok(fname: str) -> bool:
+    return bool(ASSET.match(fname)) and fname.rsplit(".", 1)[-1].lower() in ASSET_TYPES
 
 MD_CSS = """
 .md{line-height:1.6;max-width:860px}.md h1{font-size:24px}.md h2{font-size:19px;margin-top:28px}.md h3{font-size:16px}
@@ -1135,7 +1151,8 @@ MD_CSS = """
 
 
 def render_md(text: str) -> str:
-    return markdown.markdown(text or "", extensions=["tables", "fenced_code", "sane_lists"])
+    # raw HTML is escaped, javascript:/data: links are refused — the task page is public
+    return MD.render(text or "")
 
 
 def slugify(name: str) -> str:
@@ -1196,8 +1213,20 @@ def table_definition(table: str) -> tuple[str, str]:
 
 def save_sample(name: str, tables: list[str], task: str, readme: str, assets: list[tuple[str, bytes]],
                 overwrite: bool) -> str:
+    if len(name) > 100:
+        raise ValueError("the name is longer than 100 characters")
+    if len(task.encode()) > MAX_TEXT or len(readme.encode()) > MAX_TEXT:
+        raise ValueError(f"task.md and readme.md are limited to {MAX_TEXT // 1024} KB each")
+    for fname, content in assets:
+        if not asset_ok(fname):
+            raise ValueError(f"attachment {fname}: allowed types are {', '.join(sorted(ASSET_TYPES))}")
+        if len(content) > MAX_ASSET:
+            raise ValueError(f"attachment {fname} is larger than {fmt_bytes(MAX_ASSET)}")
     slug = slugify(name)
     final = SAMPLES / slug
+    if not final.exists() and len(list_samples()) >= MAX_SAMPLES:
+        raise ValueError(f"at most {MAX_SAMPLES} samples")
+    check_disk(sum(len(c) for _, c in assets))
     if final.exists() and not overwrite:
         raise ValueError(f"a sample '{slug}' already exists (tick 'overwrite' to replace it)")
     for t in tables:
@@ -1219,8 +1248,7 @@ def save_sample(name: str, tables: list[str], task: str, readme: str, assets: li
             for f in (final / "assets").iterdir():
                 shutil.copy2(f, tmp / "assets" / f.name)
         for fname, content in assets:
-            if ASSET.match(fname):
-                (tmp / "assets" / fname).write_bytes(content)
+            (tmp / "assets" / fname).write_bytes(content)
         (tmp / "sample.json").write_text(json.dumps({
             "name": name, "created": time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime()), "tables": defs}, indent=1))
         if final.exists():
@@ -1236,6 +1264,7 @@ def load_sample(slug: str) -> list[str]:
     meta = sample_meta(slug)
     if not meta:
         raise ValueError(f"sample {slug} not found")
+    check_disk(sum((SAMPLES / slug / "data" / t["file"]).stat().st_size for t in meta["tables"]) * 8)
     loaded = []
     for t in meta["tables"]:
         uid = secrets.token_hex(16)
@@ -1336,13 +1365,14 @@ def sample_new_form(request: Request):
 <div class='row' style='justify-content:space-between'><h1>Save tables as a sample</h1><a href="{P}/#samples">← back</a></div>
 {flash(request)}
 <section><form method="post" action="{P}/samples/new" enctype="multipart/form-data">
-<p><label>name <input type="text" name="name" value="{e(src.get('name', ''))}" required style="width:420px"></label></p>
+<p><label>name <input type="text" name="name" value="{e(src.get('name', ''))}" required maxlength="100" style="width:420px"></label></p>
 <p>tables to include:<br>{checks or "<span class='muted'>no tables loaded</span>"}</p>
 <p>task.md — shown to the candidate (Markdown):</p>
 <textarea name="task" rows="16">{e(src.get('task', ''))}</textarea>
 <p>readme.md — interviewer notes, admin only (Markdown; images from attachments as <code>![](assets/file.png)</code>):</p>
 <textarea name="readme" rows="16">{e(src.get('readme', ''))}</textarea>
-<p>attachments for the readme: <input type="file" name="assets" multiple></p>
+<p>attachments for the readme: <input type="file" name="assets" multiple accept="{','.join('.' + k for k in ASSET_TYPES)}">
+<span class="muted">{', '.join(sorted(ASSET_TYPES))}, up to 10 MB each</span></p>
 <p><label><input type="checkbox" name="overwrite" value="1" {'checked' if src else ''}> overwrite a sample with the same name</label></p>
 <button>Save sample</button></form></section>"""
     return page("Save sample", body)
@@ -1413,9 +1443,12 @@ def sample_asset(request: Request, slug: str, fname: str):
     if (r := guard(request)):
         return r
     path = sample_dir(slug)
-    if not path or not ASSET.match(fname) or not (path / "assets" / fname).is_file():
+    if not path or not asset_ok(fname) or not (path / "assets" / fname).is_file():
         return Response("Not found", status_code=404)
-    return FileResponse(path / "assets" / fname)
+    kind = ASSET_TYPES[fname.rsplit(".", 1)[-1].lower()]
+    inline = kind.startswith("image/")
+    return FileResponse(path / "assets" / fname, media_type=kind,
+                        content_disposition_type="inline" if inline else "attachment", filename=fname)
 
 
 @app.post(P + "/samples/{slug}/texts")
@@ -1425,6 +1458,9 @@ def sample_texts(request: Request, slug: str, task: str = Form(""), readme: str 
     path = sample_dir(slug)
     if not path:
         return back(err="Sample not found", anchor="#samples")
+    if len(task.encode()) > MAX_TEXT or len(readme.encode()) > MAX_TEXT:
+        return RedirectResponse(f"{P}/samples/{slug}/?err={quote('task.md and readme.md are limited to 200 KB each')}",
+                                status_code=303)
     (path / "task.md").write_text(task)
     (path / "readme.md").write_text(readme)
     return RedirectResponse(f"{P}/samples/{slug}/?msg={quote('Texts saved')}", status_code=303)

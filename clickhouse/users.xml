@@ -1,4 +1,7 @@
-<!-- Two users only: `loader` (the admin app: DDL + file() loads) and `metabase` (read-only, database `interview`). -->
+<!-- Two users only, both scoped to the database `interview`:
+     loader   — the admin app: tables in `interview` + reading files from user_files (the uploads mount) via file();
+                no url()/remote()/s3()/mysql()/... and no other databases;
+     metabase — read-only SELECT/SHOW on `interview`. -->
 <clickhouse>
     <profiles>
         <loader>
@@ -23,7 +26,10 @@
             <networks><ip>::/0</ip></networks>
             <profile>loader</profile>
             <quota>default</quota>
-            <grants><query>GRANT ALL ON *.*</query></grants>
+            <grants>
+                <query>GRANT SELECT, INSERT, ALTER, CREATE TABLE, DROP TABLE, TRUNCATE, SHOW, CREATE DATABASE ON interview.*</query>
+                <query>GRANT CREATE TEMPORARY TABLE, FILE ON *.*</query>
+            </grants>
         </loader>
         <metabase>
             <password from_env="CH_METABASE_PASSWORD"/>

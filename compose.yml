@@ -1,8 +1,17 @@
 # Interview stack: ClickHouse + Metabase (+ its Postgres app DB).
-# Started / stopped only by the admin app (`docker compose -p interview ...`);
+# Started / stopped only by the controller (ctl/interview_ctl.py) on the admin's request;
 # `down` removes every container, so a stopped stack uses no RAM or CPU — only the
-# two named volumes stay on disk. Variables come from state/stack.env (written by the admin).
+# two named volumes stay on disk. Variables come from ctl/stack.env (written by the controller).
+# Every container runs as a non-root user with no capabilities and no-new-privileges, on the
+# external network interview_net (bridge br-interview), from which the controller's firewall
+# rules allow no new outbound connections — no internet, no host services.
 name: interview
+
+x-hardening: &hardening
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  pids_limit: 512
+  networks: [iv]
 
 x-logging: &logging
   driver: local
@@ -13,7 +22,10 @@ x-logging: &logging
 
 services:
   clickhouse:
+    <<: *hardening
     image: clickhouse/clickhouse-server:26.9
+    user: "101:101"
+    read_only: true
     environment:
       CLICKHOUSE_SKIP_USER_SETUP: "1"
       CLICKHOUSE_DO_NOT_CHOWN: "1"
@@ -25,9 +37,8 @@ services:
       - ./clickhouse/users.xml:/etc/clickhouse-server/users.d/zz-interview.xml:ro
       - ./uploads:/var/lib/clickhouse/user_files/uploads:ro
     tmpfs:
-      - /var/log/clickhouse-server:size=16m
-    ports:
-      - "127.0.0.1:18123:8123"
+      - /var/log/clickhouse-server:size=16m,uid=101,gid=101
+      - /tmp:size=256m,uid=101,gid=101
     ulimits:
       nofile: { soft: 262144, hard: 262144 }
     mem_limit: 1536m
@@ -37,7 +48,13 @@ services:
     restart: "no"
 
   metabase-db:
+    <<: *hardening
     image: postgres:17-alpine
+    user: "70:70"
+    read_only: true
+    tmpfs:
+      - /var/run/postgresql:size=8m,uid=70,gid=70
+      - /tmp:size=64m,uid=70,gid=70
     environment:
       POSTGRES_DB: metabase
       POSTGRES_USER: metabase
@@ -67,7 +84,13 @@ services:
     restart: "no"
 
   metabase:
+    <<: *hardening
     image: metabase/metabase:v0.63.19.2
+    user: "2000:2000"
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,uid=2000,gid=2000
+      - /plugins:size=256m,uid=2000,gid=2000
     depends_on:
       - metabase-db
     environment:
@@ -84,6 +107,7 @@ services:
       MB_LOAD_SAMPLE_CONTENT: "false"
       MB_COLORIZE_LOGS: "false"
       MB_EMOJI_IN_LOGS: "false"
+      MB_PLUGINS_DIR: /plugins
       JAVA_TIMEZONE: UTC
       JAVA_OPTS: >-
         -Xmx1024m -XX:+UseSerialGC -XX:MaxMetaspaceSize=400m
@@ -102,3 +126,8 @@ services:
 volumes:
   ch_data:
   pg_data:
+
+networks:
+  iv:
+    external: true
+    name: interview_net
