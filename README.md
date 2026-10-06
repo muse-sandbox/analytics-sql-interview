@@ -126,7 +126,7 @@ network beyond the stack.
     - attachments — 10 MB each, `png/jpg/jpeg/gif/webp/csv/txt/pdf` only, so no SVG or HTML;
     - at most 50 samples.
   - Markdown is rendered with raw HTML escaped and `javascript:` links refused.
-  - Every page sends CSP, `nosniff`, `no-referrer` and `DENY` framing headers. The public task
+  - Every page sends CSP, `nosniff`, `same-origin` referrer policy and `DENY` framing headers. The public task
     page sends `default-src 'none'`.
 - **Secrets on the host.** The plain admin password and the controller secrets (`ctl/`) are
   root-only and are not mounted into any container.

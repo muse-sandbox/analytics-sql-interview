@@ -94,7 +94,8 @@ async def security_headers(request, call_next):
     response = await call_next(request)
     response.headers["Content-Security-Policy"] = TASK_CSP if request.url.path.startswith("/iv-task/") else ADMIN_CSP
     response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["Referrer-Policy"] = "no-referrer"
+    # not "no-referrer": with it browsers send `Origin: null` on form POSTs and the same-origin check fails
+    response.headers["Referrer-Policy"] = "same-origin"
     response.headers["X-Frame-Options"] = "DENY"
     return response
 LOCK = threading.RLock()
@@ -701,7 +702,9 @@ def login(request: Request, username: str = Form(""), password: str = Form("")):
     recent = [t for t in FAILS.get(ip, []) if now - t < 900]
     if len(recent) >= 5:
         return RedirectResponse(f"{P}/login?err={quote('Too many attempts, try again in 15 minutes')}", status_code=303)
-    if not same_origin(request) or not (hmac.compare_digest(username.encode(), ADMIN_USER.encode()) & verify_password(password)):
+    if not same_origin(request):
+        return RedirectResponse(f"{P}/login?err={quote('Request refused: cross-origin form submission')}", status_code=303)
+    if not (hmac.compare_digest(username.encode(), ADMIN_USER.encode()) & verify_password(password)):
         recent.append(now)
         FAILS[ip] = recent
         time.sleep(1)
