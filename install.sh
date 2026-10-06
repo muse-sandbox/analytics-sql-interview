@@ -53,6 +53,7 @@ install -m 644 "$SRC/clickhouse/config.xml" "$SRC/clickhouse/users.xml" "$DEST/c
 install -m 644 "$SRC/metabase/log4j2.xml" "$DEST/metabase/"
 install -m 644 "$SRC/admin/app.py" "$SRC/admin/requirements.txt" "$SRC/admin/Dockerfile" "$SRC/admin/compose.yml" "$DEST/admin/"
 install -m 700 "$SRC/ctl/interview_ctl.py" "$DEST/ctl/interview_ctl.py"
+install -m 750 "$SRC/bin/iv" /usr/local/bin/iv
 
 for sample in "$SRC"/samples/*/; do
     [ -f "$sample/sample.json" ] || continue

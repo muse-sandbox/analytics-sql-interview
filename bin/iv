@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+# iv — command line for the interview stack, run as root ON THE SERVER (agents: `ssh <host> iv ...`).
+# It drives the admin web app over HTTPS on localhost (login, cookie, Origin header handled here),
+# so every action goes through the same validation and limits as the browser admin.
+#
+#   iv status                                   phase, Metabase URL, task URL, timer (JSON)
+#   iv start [--sample SLUG] [--hours 2|4|8|24|0] [--no-wait]
+#   iv stop | iv wipe --yes | iv extend
+#   iv samples                                  saved samples (slug, name, tables)
+#   iv load-sample SLUG                         recreate a sample's tables in the running stack
+#   iv infer FILE [--format F] [--delim D] [--no-nullable]     print the schema ClickHouse infers
+#   iv upload FILE TABLE [--format F] [--delim D] [--schema SCHEMA_FILE] [--order-by EXPR]
+#                        [--replace] [--no-nullable] [--errors N]
+#   iv drop TABLE
+#   iv tables                                   tables in `interview` with row counts
+#   iv sql "SELECT ..."                         read-only query as the candidates' ClickHouse user
+#   iv user [NOTE]                              create a candidate Metabase user, print URL/login/password/task
+#   iv users                                    candidate users
+#   iv deactivate USER_ID                       deactivate a candidate user
+#   iv save-sample NAME --tables T1,T2 --task TASK.md --readme README.md [--asset FILE]... [--overwrite]
+#   iv delete-sample SLUG --yes
+#
+# Formats: CSVWithNames (default), CSV, TSVWithNames, TSV. Delimiters (CSV only): , ; |
+# A schema file has one `column Type` per line, in the file's column order.
+set -euo pipefail
+
+HOME_DIR=/opt/interview
+CRED="$HOME_DIR/admin_credentials.txt"
+[ -r "$CRED" ] || { echo "iv: run as root on the interview server ($CRED not readable)" >&2; exit 2; }
+ADMIN_URL="$(awk '/^url:/{print $2}' "$CRED")"
+BASE="${ADMIN_URL%/iv-admin/}"
+HOSTNAME_ONLY="${BASE#https://}"; HOSTNAME_ONLY="${HOSTNAME_ONLY%%/*}"; HOSTNAME_ONLY="${HOSTNAME_ONLY%%:*}"
+JAR="$(mktemp)"; trap 'rm -f "$JAR"' EXIT
+C=(curl -sk --resolve "$HOSTNAME_ONLY:443:127.0.0.1" -b "$JAR" -c "$JAR" -H "Origin: $BASE")
+P="$BASE/iv-admin"
+
+die() { echo "iv: $*" >&2; exit 1; }
+unq() { python3 -c 'import sys,urllib.parse;print(urllib.parse.unquote(sys.argv[1]))' "$1"; }
+
+# Print the flash message of an admin redirect; fail on ?err=.
+result() {
+    local loc="$1"
+    case "$loc" in
+        *err=*) unq "$(printf '%s' "${loc#*err=}" | sed 's/#.*//')" >&2; exit 1 ;;
+        *msg=*) unq "$(printf '%s' "${loc#*msg=}" | sed 's/#.*//')" ;;
+        "") die "no response from the admin (is the interview-admin container up?)" ;;
+        *) echo "ok" ;;
+    esac
+}
+
+login() {
+    local pw loc
+    pw="$(awk '/^password:/{print $2}' "$CRED")"
+    loc="$("${C[@]}" -o /dev/null -w '%{redirect_url}' --data-urlencode "username=admin" --data-urlencode "password=$pw" "$P/login")"
+    [ "$loc" = "$P/" ] || die "admin login failed: $(unq "${loc#*err=}")"
+}
+
+status_json() { "${C[@]}" "$P/api/status"; }
+phase() { status_json | python3 -c 'import sys,json;print(json.load(sys.stdin)["phase"])'; }
+
+secret() { python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$HOME_DIR/state/secrets.json" "$1"; }
+ch_query() {  # $1 = user (loader|metabase), $2 = SQL; runs inside the ClickHouse container
+    local user="$1" key="ch_${1}_password"
+    docker exec -i interview-clickhouse-1 clickhouse-client --user "$user" --password "$(secret "$key")" \
+        --database interview --format PrettyCompactMonoBlock --query "$2"
+}
+
+upload_file() {  # prints the upload id
+    local file="$1" loc
+    [ -f "$file" ] || die "no such file: $file"
+    loc="$("${C[@]}" -o /dev/null -w '%{redirect_url}' -F "file=@$file" "$P/tables/upload")"
+    case "$loc" in */tables/prepare/*) echo "${loc##*/}" ;; *) result "$loc" ;; esac
+}
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+    help|-h|--help) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+esac
+login
+
+case "$cmd" in
+status)
+    status_json | python3 -m json.tool ;;
+
+start)
+    sample="" hours=4 wait=1
+    while [ $# -gt 0 ]; do case "$1" in
+        --sample) sample="$2"; shift 2 ;; --hours) hours="$2"; shift 2 ;; --no-wait) wait=0; shift ;;
+        *) die "unknown option $1" ;; esac; done
+    if [ -n "$sample" ] && [ ! -f "$HOME_DIR/samples/$sample/sample.json" ]; then die "no sample '$sample' (see: iv samples)"; fi
+    result "$("${C[@]}" -o /dev/null -w '%{redirect_url}' --data-urlencode "hours=$hours" --data-urlencode "sample=$sample" "$P/stack/up")" >/dev/null
+    if [ "$wait" = 1 ]; then
+        for _ in $(seq 1 120); do p="$(phase)"; [ "$p" != starting ] && break; sleep 10; done
+        status_json | python3 -m json.tool
+        [ "$(phase)" = ready ] || exit 1
+    else
+        status_json | python3 -m json.tool
+    fi ;;
+
+stop)
+    "${C[@]}" -o /dev/null -X POST "$P/stack/down"
+    for _ in $(seq 1 30); do [ "$(phase)" = stopped ] && break; sleep 3; done
+    status_json | python3 -m json.tool ;;
+
+wipe)
+    [ "${1:-}" = "--yes" ] || die "wipe deletes all tables, Metabase users and questions; repeat with --yes"
+    "${C[@]}" -o /dev/null -X POST "$P/stack/wipe"
+    for _ in $(seq 1 30); do [ "$(phase)" = stopped ] && break; sleep 3; done
+    status_json | python3 -m json.tool ;;
+
+extend)
+    result "$("${C[@]}" -o /dev/null -w '%{redirect_url}' -X POST "$P/stack/extend")" ;;
+
+samples)
+    for f in "$HOME_DIR"/samples/*/sample.json; do
+        [ -f "$f" ] || continue
+        python3 - "$f" <<'PY'
+import json, os, sys
+m = json.load(open(sys.argv[1]))
+slug = os.path.basename(os.path.dirname(sys.argv[1]))
+print(f"{slug}\t{m['name']}\t" + ", ".join(f"{t['name']}({t.get('rows', '?')})" for t in m["tables"]))
+PY
+    done ;;
+
+load-sample)
+    [ -n "${1:-}" ] || die "usage: iv load-sample SLUG"
+    result "$("${C[@]}" -o /dev/null -w '%{redirect_url}' -X POST "$P/samples/$1/load")" ;;
+
+infer)
+    file="${1:-}"; shift || true; fmt=CSVWithNames delim=, nullable=1
+    while [ $# -gt 0 ]; do case "$1" in
+        --format) fmt="$2"; shift 2 ;; --delim) delim="$2"; shift 2 ;; --no-nullable) nullable=0; shift ;;
+        *) die "unknown option $1" ;; esac; done
+    uid="$(upload_file "$file")"
+    "${C[@]}" -G "$P/tables/prepare/$uid" --data-urlencode "fmt=$fmt" --data-urlencode "delim=$delim" \
+        --data-urlencode "nullable=$nullable" --data-urlencode "nullable_set=1" \
+        | python3 -c 'import sys,re,html;t=sys.stdin.read();m=re.search(r"<textarea name=\"schema\"[^>]*>(.*?)</textarea>",t,re.S);e=re.search(r"Schema detection failed: (.*?)</div>",t,re.S);print(html.unescape(m.group(1)) if m and m.group(1).strip() else "detection failed: "+html.unescape(e.group(1) if e else "?"))'
+    "${C[@]}" -o /dev/null -X POST "$P/tables/discard/$uid" ;;
+
+upload)
+    file="${1:-}" table="${2:-}"; shift 2 || die "usage: iv upload FILE TABLE [options]"
+    fmt=CSVWithNames delim=, schema="" order="tuple()" replace="" nullable=1 errors=0
+    while [ $# -gt 0 ]; do case "$1" in
+        --format) fmt="$2"; shift 2 ;; --delim) delim="$2"; shift 2 ;; --schema) schema="$2"; shift 2 ;;
+        --order-by) order="$2"; shift 2 ;; --replace) replace=1; shift ;; --no-nullable) nullable=0; shift ;;
+        --errors) errors="$2"; shift 2 ;; *) die "unknown option $1" ;; esac; done
+    [ -z "$schema" ] || [ -f "$schema" ] || die "no such schema file: $schema"
+    uid="$(upload_file "$file")"
+    args=(--data-urlencode "table=$table" --data-urlencode "fmt=$fmt" --data-urlencode "delim=$delim"
+          --data-urlencode "nullable=$nullable" --data-urlencode "order_by=$order" --data-urlencode "errors_num=$errors"
+          --data-urlencode "replace=$replace")
+    if [ -n "$schema" ]; then args+=(--data-urlencode "mode=manual" --data-urlencode "schema@$schema"); else args+=(--data-urlencode "mode=auto"); fi
+    loc="$("${C[@]}" -o /dev/null -w '%{redirect_url}' "${args[@]}" "$P/tables/create/$uid")"
+    case "$loc" in
+        */tables/prepare/*err=*) "${C[@]}" -o /dev/null -X POST "$P/tables/discard/$uid"; result "$loc" ;;
+        *) result "$loc" ;;
+    esac ;;
+
+drop)
+    [ -n "${1:-}" ] || die "usage: iv drop TABLE"
+    result "$("${C[@]}" -o /dev/null -w '%{redirect_url}' --data-urlencode "table=$1" "$P/tables/drop")" ;;
+
+tables)
+    ch_query loader "SELECT name, total_rows AS rows, formatReadableSize(total_bytes) AS size FROM system.tables WHERE database = 'interview' ORDER BY name" ;;
+
+sql)
+    [ -n "${1:-}" ] || die "usage: iv sql \"SELECT ...\""
+    ch_query metabase "$1" ;;
+
+user)
+    result "$("${C[@]}" -o /dev/null -w '%{redirect_url}' --data-urlencode "note=${1:-}" "$P/users/create")" >/dev/null
+    status_json | python3 -c '
+import json, sys
+st = json.load(sys.stdin)
+u = json.load(open("/opt/interview/state/candidates.json"))[-1]
+lines = ["URL: " + str(st["url"]), "login: " + u["email"], "password: " + u["password"]]
+if st.get("task_url"):
+    lines.append("task: " + st["task_url"])
+print("\n".join(lines))' ;;
+
+users)
+    python3 -c '
+import json
+for u in json.load(open("/opt/interview/state/candidates.json")):
+    print(u["id"], u["email"], "active" if u.get("active") else "deactivated", u.get("note", ""), u["created"], sep="\t")' 2>/dev/null || true ;;
+
+deactivate)
+    [ -n "${1:-}" ] || die "usage: iv deactivate USER_ID"
+    result "$("${C[@]}" -o /dev/null -w '%{redirect_url}' --data-urlencode "user_id=$1" "$P/users/deactivate")" ;;
+
+delete-sample)
+    [ -n "${1:-}" ] && [ "${2:-}" = "--yes" ] || die "usage: iv delete-sample SLUG --yes"
+    [ -f "$HOME_DIR/samples/$1/sample.json" ] || die "no sample '$1'"
+    result "$("${C[@]}" -o /dev/null -w '%{redirect_url}' -X POST "$P/samples/$1/delete")" ;;
+
+save-sample)
+    name="${1:-}"; shift || die "usage: iv save-sample NAME --tables T1,T2 --task FILE --readme FILE"
+    tables="" task="" readme="" overwrite=""; assets=()
+    while [ $# -gt 0 ]; do case "$1" in
+        --tables) tables="$2"; shift 2 ;; --task) task="$2"; shift 2 ;; --readme) readme="$2"; shift 2 ;;
+        --asset) assets+=(-F "assets=@$2"); shift 2 ;; --overwrite) overwrite=1; shift ;;
+        *) die "unknown option $1" ;; esac; done
+    [ -n "$name" ] && [ -n "$tables" ] && [ -f "$task" ] && [ -f "$readme" ] || die "name, --tables, --task FILE and --readme FILE are required"
+    targs=(); IFS=, read -ra tl <<< "$tables"; for t in "${tl[@]}"; do targs+=(-F "tables=$t"); done
+    loc="$("${C[@]}" -o /dev/null -w '%{redirect_url}' -F "name=$name" "${targs[@]}" -F "task=<$task" -F "readme=<$readme" \
+           ${assets[@]+"${assets[@]}"} ${overwrite:+-F overwrite=1} "$P/samples/new")"
+    case "$loc" in */samples/new*) result "$loc" ;; *) echo "saved: ${loc%%\?*}" ;; esac ;;
+
+*)
+    die "unknown command '$cmd' (iv help)" ;;
+esac

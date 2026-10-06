@@ -160,6 +160,12 @@ The token check works like this: nginx `auth_request` calls `/_internal/mbcheck`
 reachable from outside. A token that does not match the current one, or a stack that is not
 ready, gets a 404.
 
+## Command line on the server
+
+`install.sh` puts `iv` into `/usr/local/bin`. It drives the admin as root on the server, so scripts and agents don't need the browser:
+`iv status`, `iv start --sample <slug>`, `iv user "<name>"`, `iv upload FILE TABLE --schema FILE`, `iv sql "SELECT …"`, `iv save-sample …`.
+`iv help` lists all commands. The agent guide is `CLAUDE.md`.
+
 ## Install / update
 
 From a laptop with root ssh access to the server:
