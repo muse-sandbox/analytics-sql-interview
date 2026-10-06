@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Interview Metabase: warnings and errors only, console only (docker keeps at most 1 MB). -->
+<Configuration status="WARN">
+  <Appenders>
+    <Console name="STDOUT" target="SYSTEM_OUT">
+      <PatternLayout pattern="%d{ISO8601} %-5p %c{1} :: %m%n"/>
+    </Console>
+  </Appenders>
+  <Loggers>
+    <Logger name="metabase" level="WARN"/>
+    <Root level="WARN">
+      <AppenderRef ref="STDOUT"/>
+    </Root>
+  </Loggers>
+</Configuration>

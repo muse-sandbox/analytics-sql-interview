@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+# sample data and interviewer notes live on the server, not in this public repository
+samples/*/data/
+samples/*/readme.md
+samples/*/assets/

@@ -1,0 +1,36 @@
+<!-- Two users only: `loader` (the admin app: DDL + file() loads) and `metabase` (read-only, database `interview`). -->
+<clickhouse>
+    <profiles>
+        <loader>
+            <max_memory_usage>1000000000</max_memory_usage>
+            <max_threads>2</max_threads>
+            <max_insert_threads>2</max_insert_threads>
+        </loader>
+        <analyst>
+            <readonly>2</readonly>
+            <max_memory_usage>800000000</max_memory_usage>
+            <max_threads>2</max_threads>
+            <max_execution_time>120</max_execution_time>
+            <!-- 26.x answers compress=1 with ZSTD; the Metabase JDBC driver only reads LZ4. -->
+            <network_compression_method>LZ4</network_compression_method>
+        </analyst>
+    </profiles>
+
+    <users>
+        <default remove="1"/>
+        <loader>
+            <password from_env="CH_LOADER_PASSWORD"/>
+            <networks><ip>::/0</ip></networks>
+            <profile>loader</profile>
+            <quota>default</quota>
+            <grants><query>GRANT ALL ON *.*</query></grants>
+        </loader>
+        <metabase>
+            <password from_env="CH_METABASE_PASSWORD"/>
+            <networks><ip>::/0</ip></networks>
+            <profile>analyst</profile>
+            <quota>default</quota>
+            <grants><query>GRANT SELECT, SHOW ON interview.*</query></grants>
+        </metabase>
+    </users>
+</clickhouse>

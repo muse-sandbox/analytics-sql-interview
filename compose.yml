@@ -1,0 +1,104 @@
+# Interview stack: ClickHouse + Metabase (+ its Postgres app DB).
+# Started / stopped only by the admin app (`docker compose -p interview ...`);
+# `down` removes every container, so a stopped stack uses no RAM or CPU — only the
+# two named volumes stay on disk. Variables come from state/stack.env (written by the admin).
+name: interview
+
+x-logging: &logging
+  driver: local
+  options:
+    max-size: "1m"
+    max-file: "1"
+    compress: "false"
+
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.9
+    environment:
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
+      CLICKHOUSE_DO_NOT_CHOWN: "1"
+      CH_LOADER_PASSWORD: ${CH_LOADER_PASSWORD}
+      CH_METABASE_PASSWORD: ${CH_METABASE_PASSWORD}
+    volumes:
+      - ch_data:/var/lib/clickhouse
+      - ./clickhouse/config.xml:/etc/clickhouse-server/config.d/zz-interview.xml:ro
+      - ./clickhouse/users.xml:/etc/clickhouse-server/users.d/zz-interview.xml:ro
+      - ./uploads:/var/lib/clickhouse/user_files/uploads:ro
+    tmpfs:
+      - /var/log/clickhouse-server:size=16m
+    ports:
+      - "127.0.0.1:18123:8123"
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    mem_limit: 1536m
+    cpus: 2.0
+    oom_score_adj: 500
+    logging: *logging
+    restart: "no"
+
+  metabase-db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: metabase
+      POSTGRES_USER: metabase
+      POSTGRES_PASSWORD: ${PG_PASSWORD}
+    command:
+      - postgres
+      - -c
+      - shared_buffers=32MB
+      - -c
+      - max_connections=40
+      - -c
+      - work_mem=4MB
+      - -c
+      - maintenance_work_mem=32MB
+      - -c
+      - logging_collector=off
+      - -c
+      - log_min_messages=warning
+      - -c
+      - log_checkpoints=off
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    mem_limit: 256m
+    cpus: 0.5
+    oom_score_adj: 500
+    logging: *logging
+    restart: "no"
+
+  metabase:
+    image: metabase/metabase:v0.63.19.2
+    depends_on:
+      - metabase-db
+    environment:
+      MB_DB_TYPE: postgres
+      MB_DB_HOST: metabase-db
+      MB_DB_PORT: "5432"
+      MB_DB_DBNAME: metabase
+      MB_DB_USER: metabase
+      MB_DB_PASS: ${PG_PASSWORD}
+      MB_SITE_URL: ${MB_SITE_URL}
+      MB_SITE_NAME: Interview
+      MB_ANON_TRACKING_ENABLED: "false"
+      MB_CHECK_FOR_UPDATES: "false"
+      MB_LOAD_SAMPLE_CONTENT: "false"
+      MB_COLORIZE_LOGS: "false"
+      MB_EMOJI_IN_LOGS: "false"
+      JAVA_TIMEZONE: UTC
+      JAVA_OPTS: >-
+        -Xmx1024m -XX:+UseSerialGC -XX:MaxMetaspaceSize=400m
+        -XX:ReservedCodeCacheSize=128m -Xss512k
+        -Dlog4j2.configurationFile=file:///etc/metabase/log4j2.xml
+    volumes:
+      - ./metabase/log4j2.xml:/etc/metabase/log4j2.xml:ro
+    ports:
+      - "127.0.0.1:13000:3000"
+    mem_limit: 1792m
+    cpus: 1.5
+    oom_score_adj: 500
+    logging: *logging
+    restart: "no"
+
+volumes:
+  ch_data:
+  pg_data:
