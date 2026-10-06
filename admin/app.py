@@ -1527,7 +1527,7 @@ def sample_load(request: Request, slug: str):
 # EVAL_COOLDOWN seconds passed since their previous evaluation; any query can be evaluated by hand.
 
 EVAL_FILE = "evaluations.json"
-EVAL_COOLDOWN = 60
+EVAL_COOLDOWN = 30
 EVAL_KEEP = 400
 RESULT_ROWS = 100
 PRICES = {"input": 2.0, "cache_read": 0.2, "cache_write": 2.5, "output": 10.0}  # $ per 1M tokens, Sonnet 5.5
@@ -1677,9 +1677,12 @@ def evaluate_item(item_id: str) -> None:
         eval_save()
 
 
-def auto_candidates() -> list[dict]:
-    """Newest native query per candidate that deserves an automatic evaluation."""
-    out = []
+def auto_queue() -> dict[str, int]:
+    """Newest evaluable query per candidate still waiting for auto-evaluation -> seconds to wait.
+
+    A query whose SQL equals the candidate's previous evaluated one is not queued at all.
+    """
+    out: dict[str, int] = {}
     by_user: dict[int, list] = {}
     for i in EVAL["items"]:
         if i["candidate"] and i.get("evaluable", True):
@@ -1691,9 +1694,8 @@ def auto_candidates() -> list[dict]:
         done = [i for i in items if i.get("evaluation")]
         if done and normalize_sql(done[-1]["sql"]) == normalize_sql(latest["sql"]):
             continue
-        if done and time.time() - done[-1].get("eval_at", 0) < EVAL_COOLDOWN:
-            continue
-        out.append(latest)
+        last = max((i.get("eval_at", 0) for i in done), default=0)
+        out[latest["id"]] = max(0, int(last + EVAL_COOLDOWN - time.time()))
     return out
 
 
@@ -1705,8 +1707,9 @@ def live_loop() -> None:
         try:
             poll_query_log()
             if EVAL.get("auto"):
-                for item in auto_candidates():
-                    start_thread(evaluate_item, item["id"])
+                for item_id, wait in auto_queue().items():
+                    if wait == 0:
+                        start_thread(evaluate_item, item_id)
         except Exception:
             pass
 
@@ -1724,6 +1727,7 @@ def live_fragment() -> str:
     groups: dict[str, list] = {}
     for i in items:
         groups.setdefault(i["who"], []).append(i)
+    queued = auto_queue() if EVAL.get("auto") else {}
     html_parts = [f"<p class='muted'>{len(items)} queries · evaluations so far ≈ ${total:.2f}</p>"]
     for who, rows in groups.items():
         html_parts.append(f"<section><h2>{e(who)}</h2>")
@@ -1739,6 +1743,11 @@ def live_fragment() -> str:
                 verdict = f"<div class='md'>{render_md(i['evaluation'])}</div><p class='muted'>≈ ${i.get('cost') or 0:.3f}</p>"
             elif i.get("eval_error"):
                 verdict = f"<div class='flash err'>{e(i['eval_error'])}</div>"
+            elif i["id"] in queued:
+                wait = queued[i["id"]]
+                verdict = (f"<p class='muted'>queued — evaluation in ~{wait + 5} s "
+                           f"(at most one evaluation per candidate every {EVAL_COOLDOWN} s)</p>" if wait
+                           else "<p class='muted'>queued — evaluation starts within a few seconds</p>")
             else:
                 verdict = ""
             button = ("" if i["id"] in EVAL_PENDING or not i.get("evaluable", True) else
@@ -1748,7 +1757,7 @@ def live_fragment() -> str:
             html_parts.append(
                 f"<div style='border-top:1px solid var(--line);padding:10px 0'>"
                 f"<div class='row'><b>{when} UTC</b> {status} <span class='muted'>{i['ms']} ms</span> {button}</div>"
-                f"<details><summary>SQL</summary><pre class='mono' style='white-space:pre-wrap'>{e(i['sql'])}</pre></details>"
+                f"<details data-id='{e(i['id'])}'><summary>SQL</summary><pre class='mono' style='white-space:pre-wrap'>{e(i['sql'])}</pre></details>"
                 f"{err}{verdict}</div>")
         html_parts.append("</section>")
     return "".join(html_parts)
@@ -1770,21 +1779,27 @@ def live_page(request: Request):
 <p class='muted'>Model: Claude Sonnet 5.5 (effort low). Auto mode evaluates a candidate's newest SQL query when it changed and at least {EVAL_COOLDOWN} s
 passed since their previous evaluation. Only users created on the admin page are evaluated automatically.
 DESCRIBE / EXPLAIN / SHOW and other non-SELECT queries are listed but never sent to the model.</p></section>
+<p class='muted' id='updated'></p>
 <div id='live'>{live_fragment()}</div>"""
     js = f"""
 let ver = {EVAL.get('version', 0)};
-setInterval(async () => {{
+async function refresh(force) {{
   try {{
     const r = await fetch('{P}/live/version', {{credentials: 'same-origin'}});
     if (r.status === 401) {{ location.href = '{P}/login'; return; }}
     const v = (await r.json()).version;
-    if (v !== ver) {{
-      const open = [...document.querySelectorAll('#live details[open]')].length;
-      const f = await fetch('{P}/live/fragment', {{credentials: 'same-origin'}});
-      if (open === 0) {{ document.getElementById('live').innerHTML = await f.text(); ver = v; }}
-    }}
+    if (v === ver && !force) return;
+    const f = await fetch('{P}/live/fragment', {{credentials: 'same-origin'}});
+    if (!f.ok) return;
+    const open = new Set([...document.querySelectorAll('#live details[open]')].map(d => d.dataset.id));
+    document.getElementById('live').innerHTML = await f.text();
+    document.querySelectorAll('#live details').forEach(d => {{ if (open.has(d.dataset.id)) d.open = true; }});
+    ver = v;
+    document.getElementById('updated').textContent = 'updated ' + new Date().toLocaleTimeString();
   }} catch (e) {{}}
-}}, 4000);
+}}
+setInterval(() => refresh(false), 3000);
+setInterval(() => refresh(true), 15000);   // queue countdowns move without a version change
 """
     return page("Live evaluation", body, js, extra_css=MD_CSS)
 

@@ -87,7 +87,7 @@ How it works:
 - **Only data queries are evaluated:** `SELECT` / `WITH`, by `query_kind` or, for queries that failed
   before parsing, by the first keyword. `DESCRIBE`, `EXPLAIN`, `SHOW`, `EXISTS`, `SET` … appear
   in the list marked "not evaluated" and never reach the model.
-- **Auto mode** (default on): a candidate's newest SQL is evaluated when it changed and ≥ 60 s
+- **Auto mode** (default on): a candidate's newest SQL is evaluated when it changed and ≥ 30 s
   passed since their previous evaluation. Any query can be (re-)evaluated by hand. The list
   resets on every Start and Wipe.
 
