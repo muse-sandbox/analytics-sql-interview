@@ -9,7 +9,7 @@ accepts exactly these requests (one JSON object per connection):
   {"verb": "up", "site_url": "https://<host>/m/<token>/",
    "ch_loader_password": "<32 hex>", "ch_metabase_password": "<32 hex>"}
   {"verb": "down", "wipe": false}
-  {"verb": "ps"}
+  {"verb": "ps"}                        (containers + the stack's data volumes)
   {"verb": "stats"}
   {"verb": "logs", "service": "clickhouse" | "metabase" | "metabase-db"}
   {"verb": "evaluate", "stable": "<task + interviewer notes>", "dynamic": "<candidate query + result>"}
@@ -160,7 +160,9 @@ def handle(req):
             compose("down", "--remove-orphans", *(["-v"] if req.get("wipe") is True else []), timeout=300)
         return {}
     if verb == "ps":
-        return {"containers": ps()}
+        vols = run(["docker", "volume", "ls", "-q", "--filter", f"label=com.docker.compose.project={PROJECT}"],
+                   timeout=30, check=False).stdout.split()
+        return {"containers": ps(), "volumes": vols}
     if verb == "stats":
         names = [c["name"] for c in ps() if c["state"] == "running"]
         data = []

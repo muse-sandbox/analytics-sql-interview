@@ -176,6 +176,17 @@ def ctl(verb: str, timeout: int = 900, **params) -> dict:
     return reply
 
 
+def has_data() -> bool:
+    """Anything a wipe would delete: running containers, data volumes, candidate users, uploads."""
+    try:
+        reply = ctl("ps", timeout=60)
+    except Exception:
+        return True  # unknown -> keep the button usable
+    uploads = any(p.is_file() for p in UPLOADS.glob("*"))
+    return bool(reply.get("containers") or reply.get("volumes") or jload("candidates.json", [])
+                or (STATE / "metabase.json").exists() or uploads)
+
+
 def containers() -> list[dict]:
     try:
         return ctl("ps", timeout=60)["containers"]
@@ -811,9 +822,19 @@ def index(request: Request):
     if phase in ("ready", "starting", "error"):
         stack_html += (f"<form class='inline' method='post' action='{P}/stack/extend'><button class='sec'>+2 h to the timer</button></form>"
                        f"<form class='inline' method='post' action='{P}/stack/down'><button class='sec'>Stop</button></form>")
+    if phase == "stopped":
+        wipe_label, wipe_confirm = "Wipe data", "Delete ALL tables, Metabase users and questions?"
+        nothing = not has_data()
+    else:
+        wipe_label, wipe_confirm = "Stop and wipe data", "Stop and delete ALL tables, Metabase users and questions?"
+        nothing = False
+    wipe_off = busy or nothing
     stack_html += (f"<form class='inline' method='post' action='{P}/stack/wipe' "
-                   f"onsubmit=\"return confirm('Stop and delete ALL tables, Metabase users and questions?')\">"
-                   f"<button class='bad' {'disabled' if busy else ''}>Stop and wipe data</button></form></div>")
+                   f"onsubmit=\"return confirm('{wipe_confirm}')\">"
+                   f"<button class='bad' {'disabled' if wipe_off else ''} "
+                   f"title='{'nothing to wipe: no containers, data volumes or candidate users' if nothing else ''}'>"
+                   f"{wipe_label}</button></form>"
+                   + ("<span class='muted'>nothing to wipe</span>" if nothing else "") + "</div>")
     if stats_rows:
         stack_html += f"<table style='margin-top:12px'><tr><th>container</th><th>CPU</th><th>memory</th></tr>{stats_rows}</table>"
     stack_html += f"<p class='muted'>Server memory: {e(host_memory())}.</p>"
@@ -949,6 +970,10 @@ def stack_down(request: Request):
 def stack_wipe(request: Request):
     if (r := guard(request, post=True)):
         return r
+    if STACK.get("phase") in ("starting", "stopping"):
+        return back(err="The stack is " + STACK.get("phase") + ", try again in a moment")
+    if STACK.get("phase") == "stopped" and not has_data():
+        return back(msg="Nothing to wipe")
     start_thread(do_down, True)
     time.sleep(0.3)
     return back()

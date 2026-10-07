@@ -62,8 +62,10 @@ phase() { status_json | python3 -c 'import sys,json;print(json.load(sys.stdin)["
 secret() { python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$HOME_DIR/state/secrets.json" "$1"; }
 ch_query() {  # $1 = user (loader|metabase), $2 = SQL; runs inside the ClickHouse container
     local user="$1" key="ch_${1}_password"
-    docker exec -i interview-clickhouse-1 clickhouse-client --user "$user" --password "$(secret "$key")" \
-        --database interview --format PrettyCompactMonoBlock --query "$2"
+    # the password goes in through the environment: a --password argument would show up in
+    # `docker events` and the process list
+    CLICKHOUSE_PASSWORD="$(secret "$key")" docker exec -i -e CLICKHOUSE_PASSWORD interview-clickhouse-1 \
+        clickhouse-client --user "$user" --database interview --format PrettyCompactMonoBlock --query "$2"
 }
 
 upload_file() {  # prints the upload id
