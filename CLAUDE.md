@@ -6,10 +6,10 @@ and saved interview "samples" (tables + candidate task + interviewer notes). Hum
 
 ## Rules (STRICT)
 
-1. **This repository is public.** Never commit sample data (`samples/*/data/`), interviewer notes
-   (`samples/*/readme.md`), attachments, candidate credentials, server addresses or passwords.
-   `.gitignore` already blocks the sample parts; don't work around it. A candidate must not be able
-   to find a task's answers here.
+1. **This repository is public.** Never commit anything from a sample — data, `task.md`,
+   `readme.md` (it holds the answers), `sample.json`, attachments — nor candidate credentials,
+   server addresses or passwords. The whole `samples/` directory is git-ignored; don't work around
+   it. A candidate must not be able to find a task or its answers here.
 2. **Operate the stack only through `iv` on the server** (`ssh <host> iv …`), never with
    `docker`/`docker compose` by hand, and never by editing `/opt/interview/state/*.json`. `iv` goes
    through the admin web app, so the same validation, limits and Metabase setup apply.
