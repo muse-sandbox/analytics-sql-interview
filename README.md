@@ -12,7 +12,9 @@ https://<server>/iv-task/<token>/   the active sample's task for the candidate
 
 ## Interviewer flow
 
-1. Open `/iv-admin/`, sign in, press **Start** and pick an auto-stop timer (2/4/8/24 h or never).
+1. Open `/iv-admin/`, sign in, press **Start**, pick an auto-stop timer (2/4/8/24 h or never) and
+   what happens when it ends: **stop** (data kept) or **stop and wipe** (tables, Metabase users and
+   questions deleted; samples are never touched). The choice can be switched while the stack runs.
    It is ready in ~1–2 minutes; the very first start, or the first one after a wipe, takes longer
    because it sets up Metabase. Metabase is configured automatically: an admin user, the
    ClickHouse connection (`Interview ClickHouse` → database `interview`) and SQL access for all users.

@@ -4,7 +4,7 @@
 # so every action goes through the same validation and limits as the browser admin.
 #
 #   iv status                                   phase, Metabase URL, task URL, timer (JSON)
-#   iv start [--sample SLUG] [--hours 2|4|8|24|0] [--no-wait]
+#   iv start [--sample SLUG] [--hours 2|4|8|24|0] [--wipe-at-end] [--no-wait]
 #   iv stop | iv wipe --yes | iv extend
 #   iv samples                                  saved samples (slug, name, tables)
 #   iv load-sample SLUG                         recreate a sample's tables in the running stack
@@ -84,12 +84,13 @@ status)
     status_json | python3 -m json.tool ;;
 
 start)
-    sample="" hours=4 wait=1
+    sample="" hours=4 wait=1 at_end=stop
     while [ $# -gt 0 ]; do case "$1" in
         --sample) sample="$2"; shift 2 ;; --hours) hours="$2"; shift 2 ;; --no-wait) wait=0; shift ;;
+        --wipe-at-end) at_end=wipe; shift ;;
         *) die "unknown option $1" ;; esac; done
     if [ -n "$sample" ] && [ ! -f "$HOME_DIR/samples/$sample/sample.json" ]; then die "no sample '$sample' (see: iv samples)"; fi
-    result "$("${C[@]}" -o /dev/null -w '%{redirect_url}' --data-urlencode "hours=$hours" --data-urlencode "sample=$sample" "$P/stack/up")" >/dev/null
+    result "$("${C[@]}" -o /dev/null -w '%{redirect_url}' --data-urlencode "hours=$hours" --data-urlencode "sample=$sample" --data-urlencode "at_end=$at_end" "$P/stack/up")" >/dev/null
     if [ "$wait" = 1 ]; then
         for _ in $(seq 1 120); do p="$(phase)"; [ "$p" != starting ] && break; sleep 10; done
         status_json | python3 -m json.tool

@@ -45,7 +45,7 @@ and saved interview "samples" (tables + candidate task + interviewer notes). Hum
 | command | what it does |
 | --- | --- |
 | `iv status` | JSON: `phase` (stopped / starting / ready / stopping / error), `message`, Metabase `url`, `task_url`, `auto_stop`, active `sample` |
-| `iv start [--sample SLUG] [--hours 2\|4\|8\|24\|0] [--no-wait]` | start (waits until ready, ~1.5–2 min; the first start after a wipe sets up Metabase). With `--sample`, the sample's tables, task page and Metabase "start here" question are created |
+| `iv start [--sample SLUG] [--hours 2\|4\|8\|24\|0] [--wipe-at-end] [--no-wait]` | start (waits until ready, ~1.5–2 min; the first start after a wipe sets up Metabase). With `--sample`, the sample's tables, task page and Metabase "start here" question are created |
 | `iv stop` · `iv wipe --yes` · `iv extend` | stop (data kept) · stop and delete volumes · +2 h to the auto-stop timer |
 | `iv samples` · `iv load-sample SLUG` | list samples · make the running stack hold exactly that sample: its tables are recreated and **every other table in `interview` is dropped**; other samples' "start here" questions are archived |
 | `iv infer FILE [--format F] [--delim D] [--no-nullable]` | print the schema ClickHouse would infer, without creating anything |

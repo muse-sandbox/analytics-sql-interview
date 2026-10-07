@@ -239,13 +239,14 @@ def wait_for(check, timeout: int, what: str) -> None:
     raise RuntimeError(f"{what} did not become ready in {timeout} s")
 
 
-def do_up(hours: int, resume: bool = False, sample: str | None = None) -> None:
+def do_up(hours: int, resume: bool = False, sample: str | None = None, wipe_at_end: bool = False) -> None:
     try:
         if not resume:
             token = secrets.token_urlsafe(24)
             set_stack(phase="starting", message="starting containers", token=token,
                       task_token=secrets.token_urlsafe(24), active_sample=None,
-                      auto_stop_at=(time.time() + hours * 3600) if hours else None)
+                      auto_stop_at=(time.time() + hours * 3600) if hours else None,
+                      auto_stop_wipe=bool(wipe_at_end and hours))
             eval_reset()
             cfg = secrets_cfg()
             ctl("up", site_url=f"{PUBLIC_BASE}/m/{token}/", ch_loader_password=cfg["ch_loader_password"],
@@ -310,8 +311,11 @@ def auto_stop_loop() -> None:
         time.sleep(30)
         at = STACK.get("auto_stop_at")
         if at and time.time() > at and STACK.get("phase") in ("ready", "error", "starting"):
-            do_down(False)
-            set_stack(message="stopped automatically by the timer")
+            wipe = bool(STACK.get("auto_stop_wipe"))
+            do_down(wipe)
+            if STACK.get("phase") == "stopped":
+                set_stack(message="stopped and wiped automatically by the timer" if wipe
+                          else "stopped automatically by the timer")
         cutoff = time.time() - UPLOAD_KEEP_S
         for item in UPLOADS.glob("*"):
             if item.is_file() and item.stat().st_mtime < cutoff:
@@ -750,6 +754,7 @@ def status_payload() -> dict:
         "message": STACK.get("message"),
         "url": metabase_url() if STACK.get("phase") == "ready" else None,
         "auto_stop": time.strftime("%H:%M UTC", time.gmtime(at)) if at else None,
+        "auto_stop_wipe": bool(STACK.get("auto_stop_wipe")) if at else None,
         "task_url": task_url() if STACK.get("phase") == "ready" else None,
         "sample": (sample_meta(STACK.get("active_sample") or "") or {}).get("name"),
     }
@@ -787,7 +792,11 @@ def index(request: Request):
         stack_html += (f"<p>Task page for the candidate — <b>{e(st['sample'])}</b> "
                        f"(<a href='{e(st['task_url'])}' target='_blank'>open</a>):</p>{copy_block('taskurl', st['task_url'])}")
     if st["auto_stop"]:
-        stack_html += f"<p class='muted'>Auto-stop at {e(st['auto_stop'])}.</p>"
+        wipe = STACK.get("auto_stop_wipe")
+        stack_html += (f"<p class='muted'>At {e(st['auto_stop'])}: <b>{'stop and wipe data' if wipe else 'stop (data kept)'}</b> "
+                       f"<form class='inline' method='post' action='{P}/stack/timer-mode'>"
+                       f"<input type='hidden' name='wipe' value='{0 if wipe else 1}'>"
+                       f"<button class='sec'>{'switch to stop only' if wipe else 'switch to stop and wipe'}</button></form></p>")
     stack_html += "<div class='row' style='margin-top:12px'>"
     if phase in ("stopped", "error"):
         options = "".join(f"<option value='{k}' {'selected' if k == '4' else ''}>{v}</option>" for k, v in AUTO_STOP_CHOICES.items())
@@ -796,6 +805,8 @@ def index(request: Request):
         stack_html += (f"<form class='inline' method='post' action='{P}/stack/up'>"
                        f"<label>sample <select name='sample'>{sample_opts}</select></label> "
                        f"<label>auto-stop after <select name='hours'>{options}</select></label> "
+                       f"<label>then <select name='at_end'><option value='stop'>stop (keep data)</option>"
+                       f"<option value='wipe'>stop and wipe data</option></select></label> "
                        f"<button {'disabled' if busy else ''}>Start</button></form>")
     if phase in ("ready", "starting", "error"):
         stack_html += (f"<form class='inline' method='post' action='{P}/stack/extend'><button class='sec'>+2 h to the timer</button></form>"
@@ -913,14 +924,15 @@ setInterval(poll, {3000 if busy else 15000});
 # ---------------------------------------------------------------- routes: stack
 
 @app.post(P + "/stack/up")
-def stack_up(request: Request, hours: str = Form("4"), sample: str = Form("")):
+def stack_up(request: Request, hours: str = Form("4"), sample: str = Form(""), at_end: str = Form("stop")):
     if (r := guard(request, post=True)):
         return r
     with LOCK:
         if STACK.get("phase") in ("starting", "stopping", "ready"):
             return back(err="The stack is already " + STACK.get("phase"))
         set_stack(phase="starting", message="queued")
-    start_thread(do_up, int(hours) if hours in AUTO_STOP_CHOICES else 4, False, sample if sample_dir(sample) else None)
+    start_thread(do_up, int(hours) if hours in AUTO_STOP_CHOICES else 4, False,
+                 sample if sample_dir(sample) else None, at_end == "wipe")
     return back()
 
 
@@ -940,6 +952,14 @@ def stack_wipe(request: Request):
     start_thread(do_down, True)
     time.sleep(0.3)
     return back()
+
+
+@app.post(P + "/stack/timer-mode")
+def stack_timer_mode(request: Request, wipe: str = Form("0")):
+    if (r := guard(request, post=True)):
+        return r
+    set_stack(auto_stop_wipe=wipe == "1")
+    return back(msg="When the timer ends the stack will " + ("stop and wipe data" if wipe == "1" else "stop and keep data"))
 
 
 @app.post(P + "/stack/extend")
