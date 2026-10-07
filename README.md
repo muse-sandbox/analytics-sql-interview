@@ -35,9 +35,10 @@ https://<server>/iv-task/<token>/   the active sample's task for the candidate
 ## Samples (saved interview cases)
 
 A sample is stored on the server in `/opt/interview/samples/<slug>/` and is never touched by a wipe.
-**This repository is public, so sample data, interviewer readmes and attachments stay on the
-server** (they are git-ignored here). A sample committed under `samples/<slug>/` is copied to the
-server by `install.sh` only if the server does not have that slug yet.
+**This repository is public, so samples — data, candidate tasks, interviewer notes with the
+answers, attachments — live only on the server.** The whole `samples/` directory is git-ignored
+here. (`install.sh` still copies a local `samples/<slug>/` to the server if that slug is missing
+there, which is the way to move a sample between servers without git.)
 
 | file | what it holds |
 | --- | --- |
